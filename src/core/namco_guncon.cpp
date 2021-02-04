@@ -34,14 +34,24 @@ void NamcoGunCon::Reset()
   m_transfer_state = TransferState::Idle;
 }
 
-bool NamcoGunCon::DoState(StateWrapper& sw)
+bool NamcoGunCon::DoState(StateWrapper& sw, bool apply_input_state)
 {
-  if (!Controller::DoState(sw))
+  if (!Controller::DoState(sw, apply_input_state))
     return false;
 
-  sw.Do(&m_button_state);
-  sw.Do(&m_position_x);
-  sw.Do(&m_position_y);
+  u16 button_state = m_button_state;
+  u16 position_x = m_position_x;
+  u16 position_y = m_position_y;
+  sw.Do(&button_state);
+  sw.Do(&position_x);
+  sw.Do(&position_y);
+  if (apply_input_state)
+  {
+    m_button_state = button_state;
+    m_position_x = position_x;
+    m_position_y = position_y;
+  }
+
   sw.Do(&m_transfer_state);
   return true;
 }
@@ -50,6 +60,13 @@ void NamcoGunCon::SetAxisState(s32 axis_code, float value) {}
 
 void NamcoGunCon::SetButtonState(Button button, bool pressed)
 {
+  if (button == Button::ShootOffscreen)
+  {
+    m_shoot_offscreen = pressed;
+    SetButtonState(Button::Trigger, pressed);
+    return;
+  }
+
   static constexpr std::array<u8, static_cast<size_t>(Button::Count)> indices = {{13, 3, 14}};
   if (pressed)
     m_button_state &= ~(u16(1) << indices[static_cast<u8>(button)]);
@@ -159,7 +176,9 @@ void NamcoGunCon::UpdatePosition()
 
   // are we within the active display area?
   u32 tick, line;
-  if (mouse_x < 0 || mouse_y < 0 || !g_gpu->ConvertScreenCoordinatesToBeamTicksAndLines(mouse_x, mouse_y, &tick, &line))
+  if (mouse_x < 0 || mouse_y < 0 ||
+      !g_gpu->ConvertScreenCoordinatesToBeamTicksAndLines(mouse_x, mouse_y, m_x_scale, &tick, &line) ||
+      m_shoot_offscreen)
   {
     Log_DebugPrintf("Lightgun out of range for window coordinates %d,%d", mouse_x, mouse_y);
     m_position_x = 0x01;
@@ -194,6 +213,7 @@ std::optional<s32> NamcoGunCon::StaticGetButtonCodeByName(std::string_view butto
   }
 
   BUTTON(Trigger);
+  BUTTON(ShootOffscreen);
   BUTTON(A);
   BUTTON(B);
 
@@ -210,6 +230,7 @@ Controller::AxisList NamcoGunCon::StaticGetAxisNames()
 Controller::ButtonList NamcoGunCon::StaticGetButtonNames()
 {
   return {{TRANSLATABLE("NamcoGunCon", "Trigger"), static_cast<s32>(Button::Trigger)},
+          {TRANSLATABLE("NamcoGunCon", "ShootOffscreen"), static_cast<s32>(Button::ShootOffscreen)},
           {TRANSLATABLE("NamcoGunCon", "A"), static_cast<s32>(Button::A)},
           {TRANSLATABLE("NamcoGunCon", "B"), static_cast<s32>(Button::B)}};
 }
@@ -221,11 +242,14 @@ u32 NamcoGunCon::StaticGetVibrationMotorCount()
 
 Controller::SettingList NamcoGunCon::StaticGetSettings()
 {
-  static constexpr std::array<SettingInfo, 2> settings = {
-    {{SettingInfo::Type::Path, "CrosshairImagePath", "Crosshair Image Path",
-      "Path to an image to use as a crosshair/cursor."},
-     {SettingInfo::Type::Float, "CrosshairScale", "Crosshair Image Scale", "Scale of crosshair image on screen.", "1.0",
-      "0.0001", "100.0"}}};
+  static constexpr std::array<SettingInfo, 3> settings = {
+    {{SettingInfo::Type::Path, "CrosshairImagePath", TRANSLATABLE("NamcoGunCon", "Crosshair Image Path"),
+      TRANSLATABLE("NamcoGunCon", "Path to an image to use as a crosshair/cursor.")},
+     {SettingInfo::Type::Float, "CrosshairScale", TRANSLATABLE("NamcoGunCon", "Crosshair Image Scale"),
+      TRANSLATABLE("NamcoGunCon", "Scale of crosshair image on screen."), "1.0", "0.0001", "100.0"},
+     {SettingInfo::Type::Float, "XScale", TRANSLATABLE("NamcoGunCon", "X Scale"),
+      TRANSLATABLE("NamcoGunCon", "Scales X coordinates relative to the center of the screen."), "1.0", "0.01", "2.0",
+      "0.01"}}};
 
   return SettingList(settings.begin(), settings.end());
 }
@@ -252,14 +276,17 @@ void NamcoGunCon::LoadSettings(const char* section)
   }
 
   m_crosshair_image_scale = g_host_interface->GetFloatSettingValue(section, "CrosshairScale", 1.0f);
+
+  m_x_scale = g_host_interface->GetFloatSettingValue(section, "XScale", 1.0f);
 }
 
-bool NamcoGunCon::GetSoftwareCursor(const Common::RGBA8Image** image, float* image_scale)
+bool NamcoGunCon::GetSoftwareCursor(const Common::RGBA8Image** image, float* image_scale, bool* relative_mode)
 {
   if (!m_crosshair_image.IsValid())
     return false;
 
   *image = &m_crosshair_image;
   *image_scale = m_crosshair_image_scale;
+  *relative_mode = false;
   return true;
 }

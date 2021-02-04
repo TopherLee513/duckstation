@@ -1,14 +1,19 @@
 package com.github.stenzek.duckstation;
 
 import android.content.Context;
-import android.util.ArrayMap;
+import android.content.SharedPreferences;
 import android.util.AttributeSet;
 import android.util.Log;
-import android.util.Pair;
 import android.view.InputDevice;
 import android.view.KeyEvent;
 import android.view.MotionEvent;
 import android.view.SurfaceView;
+
+import androidx.core.util.Pair;
+
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
 
 public class EmulationSurfaceView extends SurfaceView {
     public EmulationSurfaceView(Context context) {
@@ -23,143 +28,309 @@ public class EmulationSurfaceView extends SurfaceView {
         super(context, attrs, defStyle);
     }
 
-    private boolean isDPadOrButtonEvent(KeyEvent event) {
+    public static boolean isDPadOrButtonEvent(KeyEvent event) {
         final int source = event.getSource();
         return (source & InputDevice.SOURCE_GAMEPAD) == InputDevice.SOURCE_GAMEPAD ||
                 (source & InputDevice.SOURCE_DPAD) == InputDevice.SOURCE_DPAD ||
                 (source & InputDevice.SOURCE_JOYSTICK) == InputDevice.SOURCE_JOYSTICK;
     }
 
-    @Override
-    public boolean onKeyDown(int keyCode, KeyEvent event) {
-        if (isDPadOrButtonEvent(event) && event.getRepeatCount() == 0 &&
-                handleControllerKey(keyCode, true)) {
-            return true;
+    private boolean isExternalKeyCode(int keyCode) {
+        switch (keyCode) {
+            case KeyEvent.KEYCODE_BACK:
+            case KeyEvent.KEYCODE_HOME:
+            case KeyEvent.KEYCODE_MENU:
+            case KeyEvent.KEYCODE_VOLUME_UP:
+            case KeyEvent.KEYCODE_VOLUME_DOWN:
+            case KeyEvent.KEYCODE_VOLUME_MUTE:
+            case KeyEvent.KEYCODE_POWER:
+            case KeyEvent.KEYCODE_CAMERA:
+            case KeyEvent.KEYCODE_CALL:
+            case KeyEvent.KEYCODE_ENDCALL:
+            case KeyEvent.KEYCODE_VOICE_ASSIST:
+                return true;
+
+            default:
+                return false;
+        }
+    }
+
+    private static final int[] buttonKeyCodes = new int[]{
+            KeyEvent.KEYCODE_BUTTON_A,      // 0/Cross
+            KeyEvent.KEYCODE_BUTTON_B,      // 1/Circle
+            KeyEvent.KEYCODE_BUTTON_X,      // 2/Square
+            KeyEvent.KEYCODE_BUTTON_Y,      // 3/Triangle
+            KeyEvent.KEYCODE_BUTTON_SELECT, // 4/Select
+            KeyEvent.KEYCODE_BUTTON_MODE,   // 5/Analog
+            KeyEvent.KEYCODE_BUTTON_START,  // 6/Start
+            KeyEvent.KEYCODE_BUTTON_THUMBL, // 7/L3
+            KeyEvent.KEYCODE_BUTTON_THUMBR, // 8/R3
+            KeyEvent.KEYCODE_BUTTON_L1,     // 9/L1
+            KeyEvent.KEYCODE_BUTTON_R1,     // 10/R1
+            KeyEvent.KEYCODE_DPAD_UP,       // 11/Up
+            KeyEvent.KEYCODE_DPAD_DOWN,     // 12/Down
+            KeyEvent.KEYCODE_DPAD_LEFT,     // 13/Left
+            KeyEvent.KEYCODE_DPAD_RIGHT,    // 14/Right
+            KeyEvent.KEYCODE_BUTTON_L2,     // 15
+            KeyEvent.KEYCODE_BUTTON_R2,     // 16
+            KeyEvent.KEYCODE_BUTTON_C,      // 17
+            KeyEvent.KEYCODE_BUTTON_Z,      // 18
+            KeyEvent.KEYCODE_VOLUME_DOWN,   // 19
+            KeyEvent.KEYCODE_VOLUME_UP,     // 20
+            KeyEvent.KEYCODE_MENU,          // 21
+            KeyEvent.KEYCODE_CAMERA,        // 22
+    };
+    private static final int[] axisCodes = new int[]{
+            MotionEvent.AXIS_X,             // 0/LeftX
+            MotionEvent.AXIS_Y,             // 1/LeftY
+            MotionEvent.AXIS_Z,             // 2/RightX
+            MotionEvent.AXIS_RZ,            // 3/RightY
+            MotionEvent.AXIS_LTRIGGER,      // 4/L2
+            MotionEvent.AXIS_RTRIGGER,      // 5/R2
+            MotionEvent.AXIS_RX,            // 6
+            MotionEvent.AXIS_RY,            // 7
+            MotionEvent.AXIS_HAT_X,         // 8
+            MotionEvent.AXIS_HAT_Y,         // 9
+            MotionEvent.AXIS_GAS,           // 10
+            MotionEvent.AXIS_BRAKE,         // 11
+    };
+
+    public static int getButtonIndexForKeyCode(int keyCode) {
+        for (int buttonIndex = 0; buttonIndex < buttonKeyCodes.length; buttonIndex++) {
+            if (buttonKeyCodes[buttonIndex] == keyCode)
+                return buttonIndex;
         }
 
-        return super.onKeyDown(keyCode, event);
+        Log.e("EmulationSurfaceView", String.format("Button code %d not found", keyCode));
+        return -1;
+    }
+
+    public static int[] getKnownAxisCodes() {
+        return axisCodes;
+    }
+
+    public static int getAxisIndexForAxisCode(int axisCode) {
+        for (int axisIndex = 0; axisIndex < axisCodes.length; axisIndex++) {
+            if (axisCodes[axisIndex] == axisCode)
+                return axisIndex;
+        }
+
+        Log.e("EmulationSurfaceView", String.format("Axis code %d not found", axisCode));
+        return -1;
+    }
+
+
+    private class ButtonMapping {
+        public ButtonMapping(int deviceId, int deviceButton, int controllerIndex, int button) {
+            this.deviceId = deviceId;
+            this.deviceAxisOrButton = deviceButton;
+            this.controllerIndex = controllerIndex;
+            this.buttonMapping = button;
+        }
+
+        public int deviceId;
+        public int deviceAxisOrButton;
+        public int controllerIndex;
+        public int buttonMapping;
+    }
+
+    private class AxisMapping {
+        public AxisMapping(int deviceId, int deviceAxis, InputDevice.MotionRange motionRange, int controllerIndex, int axis) {
+            this.deviceId = deviceId;
+            this.deviceAxisOrButton = deviceAxis;
+            this.deviceMotionRange = motionRange;
+            this.controllerIndex = controllerIndex;
+            this.axisMapping = axis;
+            this.positiveButton = -1;
+            this.negativeButton = -1;
+        }
+
+        public AxisMapping(int deviceId, int deviceAxis, InputDevice.MotionRange motionRange, int controllerIndex, int positiveButton, int negativeButton) {
+            this.deviceId = deviceId;
+            this.deviceAxisOrButton = deviceAxis;
+            this.deviceMotionRange = motionRange;
+            this.controllerIndex = controllerIndex;
+            this.axisMapping = -1;
+            this.positiveButton = positiveButton;
+            this.negativeButton = negativeButton;
+        }
+
+        public int deviceId;
+        public int deviceAxisOrButton;
+        public InputDevice.MotionRange deviceMotionRange;
+        public int controllerIndex;
+        public int axisMapping;
+        public int positiveButton;
+        public int negativeButton;
+    }
+
+    private ArrayList<ButtonMapping> mControllerKeyMapping;
+    private ArrayList<AxisMapping> mControllerAxisMapping;
+
+    private boolean handleControllerKey(int deviceId, int keyCode, int repeatCount, boolean pressed) {
+        boolean result = false;
+        for (ButtonMapping mapping : mControllerKeyMapping) {
+            if (mapping.deviceId != deviceId || mapping.deviceAxisOrButton != keyCode)
+                continue;
+
+            if (repeatCount == 0) {
+                AndroidHostInterface.getInstance().handleControllerButtonEvent(0, mapping.buttonMapping, pressed);
+                Log.d("EmulationSurfaceView", String.format("handleControllerKey %d -> %d %d", keyCode, mapping.buttonMapping, pressed ? 1 : 0));
+            }
+
+            result = true;
+        }
+
+        return result;
+    }
+
+    @Override
+    public boolean onKeyDown(int keyCode, KeyEvent event) {
+        if (!isDPadOrButtonEvent(event))
+            return false;
+
+        if (handleControllerKey(event.getDeviceId(), keyCode, event.getRepeatCount(), true))
+            return true;
+
+        // eat non-external button events anyway
+        return !isExternalKeyCode(keyCode);
     }
 
     @Override
     public boolean onKeyUp(int keyCode, KeyEvent event) {
-        if (isDPadOrButtonEvent(event) && event.getRepeatCount() == 0 &&
-                handleControllerKey(keyCode, false)) {
-            return true;
-        }
+        if (!isDPadOrButtonEvent(event))
+            return false;
 
-        return super.onKeyDown(keyCode, event);
+        if (handleControllerKey(event.getDeviceId(), keyCode, 0, false))
+            return true;
+
+        // eat non-external button events anyway
+        return !isExternalKeyCode(keyCode);
     }
 
     @Override
     public boolean onGenericMotionEvent(MotionEvent event) {
         final int source = event.getSource();
-        if ((source & InputDevice.SOURCE_JOYSTICK) == 0)
-            return super.onGenericMotionEvent(event);
+        if ((source & (InputDevice.SOURCE_JOYSTICK | InputDevice.SOURCE_GAMEPAD | InputDevice.SOURCE_DPAD)) == 0)
+            return false;
 
-        final InputDevice device = event.getDevice();
-        for (int axis : AXISES) {
-            Integer mapping = mControllerAxisMapping.containsKey(axis) ? mControllerAxisMapping.get(axis) : null;
-            Pair<Integer, Integer> buttonMapping = mControllerAxisButtonMapping.containsKey(axis) ? mControllerAxisButtonMapping.get(axis) : null;
-            if (mapping == null && buttonMapping == null)
+        final int deviceId = event.getDeviceId();
+        for (AxisMapping mapping : mControllerAxisMapping) {
+            if (mapping.deviceId != deviceId)
                 continue;
 
-            final float axisValue = event.getAxisValue(axis);
+            final float axisValue = event.getAxisValue(mapping.deviceAxisOrButton);
             float emuValue;
 
-            final InputDevice.MotionRange range = device.getMotionRange(axis, source);
-            if (range != null) {
-                final float transformedValue = (axisValue - range.getMin()) / range.getRange();
+            if (mapping.deviceMotionRange != null) {
+                final float transformedValue = (axisValue - mapping.deviceMotionRange.getMin()) / mapping.deviceMotionRange.getRange();
                 emuValue = (transformedValue * 2.0f) - 1.0f;
             } else {
                 emuValue = axisValue;
             }
-            Log.d("EmulationSurfaceView", String.format("axis %d value %f emuvalue %f", axis, axisValue, emuValue));
-            if (mapping != null) {
-                AndroidHostInterface.getInstance().setControllerAxisState(0, mapping, emuValue);
-            } else {
-                final float DEAD_ZONE = 0.25f;
-                AndroidHostInterface.getInstance().setControllerButtonState(0, buttonMapping.first, (emuValue <= -DEAD_ZONE));
-                AndroidHostInterface.getInstance().setControllerButtonState(0, buttonMapping.second, (emuValue >= DEAD_ZONE));
-                Log.d("EmulationSurfaceView", String.format("using emuValue %f for buttons %d %d", emuValue, buttonMapping.first, buttonMapping.second));
+            Log.d("EmulationSurfaceView", String.format("axis %d value %f emuvalue %f", mapping.deviceAxisOrButton, axisValue, emuValue));
+
+            if (mapping.axisMapping >= 0) {
+                AndroidHostInterface.getInstance().handleControllerAxisEvent(0, mapping.axisMapping, emuValue);
+            }
+
+            final float DEAD_ZONE = 0.25f;
+            if (mapping.negativeButton >= 0) {
+                AndroidHostInterface.getInstance().handleControllerButtonEvent(0, mapping.negativeButton, (emuValue <= -DEAD_ZONE));
+            }
+            if (mapping.positiveButton >= 0) {
+                AndroidHostInterface.getInstance().handleControllerButtonEvent(0, mapping.positiveButton, (emuValue >= DEAD_ZONE));
             }
         }
 
         return true;
     }
 
-    private ArrayMap<Integer, Integer> mControllerKeyMapping;
-    private ArrayMap<Integer, Integer> mControllerAxisMapping;
-    private ArrayMap<Integer, Pair<Integer, Integer>> mControllerAxisButtonMapping;
-    static final int[] AXISES = new int[]{MotionEvent.AXIS_X, MotionEvent.AXIS_Y, MotionEvent.AXIS_RX,
-            MotionEvent.AXIS_RY, MotionEvent.AXIS_Z, MotionEvent.AXIS_RZ,
-            MotionEvent.AXIS_HAT_X, MotionEvent.AXIS_HAT_Y};
-
-    private void addControllerKeyMapping(int keyCode, String controllerType, String buttonName) {
-        int mapping = AndroidHostInterface.getControllerButtonCode(controllerType, buttonName);
-        Log.i("EmulationSurfaceView", String.format("Map %d to %d (%s)", keyCode, mapping,
-                buttonName));
-        if (mapping >= 0)
-            mControllerKeyMapping.put(keyCode, mapping);
-    }
-
-    private void addControllerAxisMapping(int axis, String controllerType, String axisName, String negativeButtonName, String positiveButtonName) {
-        if (axisName != null) {
-            int mapping = AndroidHostInterface.getControllerAxisCode(controllerType, axisName);
-            Log.i("EmulationSurfaceView", String.format("Map axis %d to %d (%s)", axis, mapping, axisName));
-            if (mapping >= 0) {
-                mControllerAxisMapping.put(axis, mapping);
-                return;
-            }
+    private boolean addControllerKeyMapping(int deviceId, int keyCode, int controllerIndex) {
+        int mapping = getButtonIndexForKeyCode(keyCode);
+        Log.i("EmulationSurfaceView", String.format("Map %d to %d", keyCode, mapping));
+        if (mapping >= 0) {
+            mControllerKeyMapping.add(new ButtonMapping(deviceId, keyCode, controllerIndex, mapping));
+            return true;
         }
 
-        if (negativeButtonName != null && positiveButtonName != null) {
-            final int negativeMapping = AndroidHostInterface.getControllerButtonCode(controllerType, negativeButtonName);
-            final int positiveMapping = AndroidHostInterface.getControllerButtonCode(controllerType, positiveButtonName);
-            Log.i("EmulationSurfaceView", String.format("Map axis %d to %d %d (button %s %s)", axis, negativeMapping, positiveMapping,
-                    negativeButtonName, positiveButtonName));
-            if (negativeMapping >= 0 && positiveMapping >= 0) {
-                mControllerAxisButtonMapping.put(axis, new Pair<Integer, Integer>(negativeMapping, positiveMapping));
+        return false;
+    }
+
+    private boolean addControllerAxisMapping(int deviceId, List<InputDevice.MotionRange> motionRanges, int axis, int controllerIndex) {
+        InputDevice.MotionRange range = null;
+        for (InputDevice.MotionRange curRange : motionRanges) {
+            if (curRange.getAxis() == axis) {
+                range = curRange;
+                break;
             }
         }
-    }
-
-    public void initControllerKeyMapping(String controllerType) {
-        mControllerKeyMapping = new ArrayMap<>();
-        mControllerAxisMapping = new ArrayMap<>();
-        mControllerAxisButtonMapping = new ArrayMap<>();
-
-        // TODO: Don't hardcode...
-        addControllerKeyMapping(KeyEvent.KEYCODE_DPAD_UP, controllerType, "Up");
-        addControllerKeyMapping(KeyEvent.KEYCODE_DPAD_RIGHT, controllerType, "Right");
-        addControllerKeyMapping(KeyEvent.KEYCODE_DPAD_DOWN, controllerType, "Down");
-        addControllerKeyMapping(KeyEvent.KEYCODE_DPAD_LEFT, controllerType, "Left");
-        addControllerKeyMapping(KeyEvent.KEYCODE_BUTTON_L1, controllerType, "L1");
-        addControllerKeyMapping(KeyEvent.KEYCODE_BUTTON_L2, controllerType, "L2");
-        addControllerKeyMapping(KeyEvent.KEYCODE_BUTTON_SELECT, controllerType, "Select");
-        addControllerKeyMapping(KeyEvent.KEYCODE_BUTTON_START, controllerType, "Start");
-        addControllerKeyMapping(KeyEvent.KEYCODE_BUTTON_Y, controllerType, "Triangle");
-        addControllerKeyMapping(KeyEvent.KEYCODE_BUTTON_B, controllerType, "Circle");
-        addControllerKeyMapping(KeyEvent.KEYCODE_BUTTON_A, controllerType, "Cross");
-        addControllerKeyMapping(KeyEvent.KEYCODE_BUTTON_X, controllerType, "Square");
-        addControllerKeyMapping(KeyEvent.KEYCODE_BUTTON_R1, controllerType, "R1");
-        addControllerKeyMapping(KeyEvent.KEYCODE_BUTTON_R2, controllerType, "R2");
-        addControllerAxisMapping(MotionEvent.AXIS_X, controllerType, "LeftX", null, null);
-        addControllerAxisMapping(MotionEvent.AXIS_Y, controllerType, "LeftY", null, null);
-        addControllerAxisMapping(MotionEvent.AXIS_RX, controllerType, "RightX", null, null);
-        addControllerAxisMapping(MotionEvent.AXIS_RY, controllerType, "RightY", null, null);
-        addControllerAxisMapping(MotionEvent.AXIS_Z, controllerType, "L2", "L2", "L2");
-        addControllerAxisMapping(MotionEvent.AXIS_RZ, controllerType, "R2", "R2", "R2");
-        addControllerAxisMapping(MotionEvent.AXIS_HAT_X, controllerType, null, "Left", "Right");
-        addControllerAxisMapping(MotionEvent.AXIS_HAT_Y, controllerType, null, "Up", "Down");
-    }
-
-    private boolean handleControllerKey(int keyCode, boolean pressed) {
-        if (!mControllerKeyMapping.containsKey(keyCode))
+        if (range == null)
             return false;
 
-        final int mapping = mControllerKeyMapping.get(keyCode);
-        AndroidHostInterface.getInstance().setControllerButtonState(0, mapping, pressed);
-        Log.d("EmulationSurfaceView", String.format("handleControllerKey %d -> %d %d", keyCode, mapping, pressed ? 1 : 0));
-        return true;
+        int mapping = getAxisIndexForAxisCode(axis);
+        int negativeButton = -1;
+        int positiveButton = -1;
+
+        if (mapping >= 0) {
+            Log.i("EmulationSurfaceView", String.format("Map axis %d to %d", axis, mapping));
+            mControllerAxisMapping.add(new AxisMapping(deviceId, axis, range, controllerIndex, mapping));
+            return true;
+        }
+
+        if (negativeButton >= 0 && negativeButton >= 0) {
+            Log.i("EmulationSurfaceView", String.format("Map axis %d to buttons %d %d", axis, negativeButton, positiveButton));
+            mControllerAxisMapping.add(new AxisMapping(deviceId, axis, range, controllerIndex, positiveButton, negativeButton));
+            return true;
+        }
+
+        Log.w("EmulationSurfaceView", String.format("Axis %d was not mapped", axis));
+        return false;
     }
+
+    private static boolean isJoystickDevice(int deviceId) {
+        if (deviceId < 0)
+            return false;
+
+        final InputDevice dev = InputDevice.getDevice(deviceId);
+        if (dev == null)
+            return false;
+
+        final int sources = dev.getSources();
+        if ((sources & InputDevice.SOURCE_CLASS_JOYSTICK) != 0)
+            return true;
+
+        if ((sources & InputDevice.SOURCE_GAMEPAD) == InputDevice.SOURCE_GAMEPAD)
+            return true;
+
+        return (sources & InputDevice.SOURCE_DPAD) == InputDevice.SOURCE_DPAD;
+    }
+
+    public boolean initControllerMapping(String controllerType) {
+        mControllerKeyMapping = new ArrayList<>();
+        mControllerAxisMapping = new ArrayList<>();
+
+        final int[] deviceIds = InputDevice.getDeviceIds();
+        for (int deviceId : deviceIds) {
+            if (!isJoystickDevice(deviceId))
+                continue;
+
+            InputDevice device = InputDevice.getDevice(deviceId);
+            List<InputDevice.MotionRange> motionRanges = device.getMotionRanges();
+            int controllerIndex = 0;
+
+            for (int keyCode : buttonKeyCodes) {
+                addControllerKeyMapping(deviceId, keyCode, controllerIndex);
+            }
+
+            if (motionRanges != null) {
+                for (int axisCode : axisCodes) {
+                    addControllerAxisMapping(deviceId, motionRanges, axisCode, controllerIndex);
+                }
+            }
+        }
+
+        return !mControllerKeyMapping.isEmpty() || !mControllerKeyMapping.isEmpty();
+    }
+
 }

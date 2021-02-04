@@ -18,6 +18,7 @@ public:
   bool CopyImage(CDImage* image, ProgressCallback* progress);
 
   bool ReadSubChannelQ(SubChannelQ* subq) override;
+  bool HasNonStandardSubchannel() const override;
 
 protected:
   bool ReadSectorFromIndex(void* buffer, const Index& index, LBA lba_in_index) override;
@@ -110,20 +111,7 @@ bool CDImageMemory::CopyImage(CDImage* image, ProgressCallback* progress)
   m_filename = image->GetFileName();
   m_lba_count = image->GetLBACount();
 
-  if (!image->Seek(0))
-  {
-    progress->ModalError("Failed to seek to start of image for subq read");
-    return false;
-  }
-
-  progress->SetStatusText("Looking for invalid subchannel data...");
-
-  CDImage::SubChannelQ subq;
-  for (LBA lba = 0; lba < m_lba_count; lba++)
-  {
-    if (ReadSubChannelQ(&subq) && !subq.IsCRCValid())
-      m_sbi.AddReplacementSubChannelQ(lba, subq);
-  }
+  m_sbi.LoadSBI(FileSystem::ReplaceExtension(m_filename, "sbi").c_str());
 
   return Seek(1, Position{0, 0, 0});
 }
@@ -134,6 +122,11 @@ bool CDImageMemory::ReadSubChannelQ(SubChannelQ* subq)
     return true;
 
   return CDImage::ReadSubChannelQ(subq);
+}
+
+bool CDImageMemory::HasNonStandardSubchannel() const
+{
+  return (m_sbi.GetReplacementSectorCount() > 0);
 }
 
 bool CDImageMemory::ReadSectorFromIndex(void* buffer, const Index& index, LBA lba_in_index)

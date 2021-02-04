@@ -20,8 +20,8 @@
 
 #include "pgxp.h"
 #include "settings.h"
-#include <cmath>
 #include <climits>
+#include <cmath>
 
 namespace PGXP {
 // pgxp_types.h
@@ -104,7 +104,6 @@ static void MaskValidate(PGXP_value* pV, u32 psxV, u32 mask, u32 validMask);
 
 static double f16Sign(double in);
 static double f16Unsign(double in);
-static double fu16Trunc(double in);
 static double f16Overflow(double in);
 
 typedef union
@@ -134,6 +133,26 @@ static void WriteMem(PGXP_value* value, u32 addr);
 static void WriteMem16(PGXP_value* src, u32 addr);
 
 // pgxp_gpu.h
+enum : u32
+{
+  VERTEX_CACHE_WIDTH = 0x800 * 2,
+  VERTEX_CACHE_HEIGHT = 0x800 * 2,
+  VERTEX_CACHE_SIZE = VERTEX_CACHE_WIDTH * VERTEX_CACHE_HEIGHT,
+  PGXP_MEM_SIZE = 3 * 2048 * 1024 / 4 // mirror 2MB in 32-bit words * 3
+};
+
+static PGXP_value* Mem = nullptr;
+
+const unsigned int mode_init = 0;
+const unsigned int mode_write = 1;
+const unsigned int mode_read = 2;
+const unsigned int mode_fail = 3;
+
+unsigned int baseID = 0;
+unsigned int lastID = 0;
+unsigned int cacheMode = 0;
+static PGXP_value* vertexCache = nullptr;
+
 void PGXP_CacheVertex(short sx, short sy, const PGXP_value* _pVertex);
 
 // pgxp_gte.h
@@ -142,8 +161,8 @@ static void PGXP_InitGTE();
 // pgxp_cpu.h
 static void PGXP_InitCPU();
 static PGXP_value CPU_reg_mem[34];
-#define CPU_Hi CPU_reg[33]
-#define CPU_Lo CPU_reg[34]
+#define CPU_Hi CPU_reg[32]
+#define CPU_Lo CPU_reg[33]
 static PGXP_value CP0_reg_mem[32];
 
 static PGXP_value* CPU_reg = CPU_reg_mem;
@@ -195,7 +214,6 @@ double f16Overflow(double in)
 
 // pgxp_mem.c
 static void PGXP_InitMem();
-static PGXP_value Mem[3 * 2048 * 1024 / 4]; // mirror 2MB in 32-bit words * 3
 static const u32 UserMemOffset = 0;
 static const u32 ScratchOffset = 2048 * 1024 / 4;
 static const u32 RegisterOffset = 2 * 2048 * 1024 / 4;
@@ -203,7 +221,19 @@ static const u32 InvalidAddress = 3 * 2048 * 1024 / 4;
 
 void PGXP_InitMem()
 {
-  memset(Mem, 0, sizeof(Mem));
+  if (!Mem)
+  {
+    Mem = static_cast<PGXP_value*>(std::calloc(PGXP_MEM_SIZE, sizeof(PGXP_value)));
+    if (!Mem)
+    {
+      std::fprintf(stderr, "Failed to allocate PGXP memory\n");
+      std::abort();
+    }
+  }
+  else
+  {
+    std::memset(Mem, 0, sizeof(PGXP_value) * PGXP_MEM_SIZE);
+  }
 }
 
 u32 PGXP_ConvertAddress(u32 addr)
@@ -366,8 +396,6 @@ void WriteMem16(PGXP_value* src, u32 addr)
 }
 
 // pgxp_main.c
-u32 static gMode = 0;
-
 void Initialize()
 {
   PGXP_InitMem();
@@ -375,24 +403,19 @@ void Initialize()
   PGXP_InitGTE();
 }
 
-void PGXP_SetModes(u32 modes)
+void Shutdown()
 {
-  gMode = modes;
-}
-
-u32 PGXP_GetModes()
-{
-  return gMode;
-}
-
-void PGXP_EnableModes(u32 modes)
-{
-  gMode |= modes;
-}
-
-void PGXP_DisableModes(u32 modes)
-{
-  gMode = gMode & ~modes;
+  cacheMode = mode_init;
+  if (vertexCache)
+  {
+    std::free(vertexCache);
+    vertexCache = nullptr;
+  }
+  if (Mem)
+  {
+    std::free(Mem);
+    Mem = nullptr;
+  }
 }
 
 // pgxp_gte.c
@@ -584,17 +607,6 @@ void CPU_SWC2(u32 instr, u32 rtVal, u32 addr)
 /////////////////////////////////
 //// Blade_Arma's Vertex Cache (CatBlade?)
 /////////////////////////////////
-const unsigned int mode_init = 0;
-const unsigned int mode_write = 1;
-const unsigned int mode_read = 2;
-const unsigned int mode_fail = 3;
-
-PGXP_value vertexCache[0x800 * 2][0x800 * 2];
-
-unsigned int baseID = 0;
-unsigned int lastID = 0;
-unsigned int cacheMode = 0;
-
 unsigned int IsSessionID(unsigned int vertID)
 {
   // No wrapping
@@ -612,6 +624,23 @@ unsigned int IsSessionID(unsigned int vertID)
   return 0;
 }
 
+static void InitPGXPVertexCache()
+{
+  if (!vertexCache)
+  {
+    vertexCache = static_cast<PGXP_value*>(std::calloc(VERTEX_CACHE_SIZE, sizeof(PGXP_value)));
+    if (!vertexCache)
+    {
+      std::fprintf(stderr, "Failed to allocate PGXP vertex cache memory\n");
+      std::abort();
+    }
+  }
+  else
+  {
+    memset(vertexCache, 0x00, VERTEX_CACHE_SIZE * sizeof(PGXP_value));
+  }
+}
+
 void PGXP_CacheVertex(short sx, short sy, const PGXP_value* _pVertex)
 {
   const PGXP_value* pNewVertex = (const PGXP_value*)_pVertex;
@@ -623,14 +652,14 @@ void PGXP_CacheVertex(short sx, short sy, const PGXP_value* _pVertex)
     return;
   }
 
+  // Initialise cache on first use
+  if (!vertexCache)
+    InitPGXPVertexCache();
+
   // if (bGteAccuracy)
   {
     if (cacheMode != mode_write)
     {
-      // Initialise cache on first use
-      if (cacheMode == mode_init)
-        memset(vertexCache, 0x00, sizeof(vertexCache));
-
       // First vertex of write session (frame?)
       cacheMode = mode_write;
       baseID = pNewVertex->count;
@@ -640,7 +669,7 @@ void PGXP_CacheVertex(short sx, short sy, const PGXP_value* _pVertex)
 
     if (sx >= -0x800 && sx <= 0x7ff && sy >= -0x800 && sy <= 0x7ff)
     {
-      pOldVertex = &vertexCache[sy + 0x800][sx + 0x800];
+      pOldVertex = &vertexCache[(sy + 0x800) * VERTEX_CACHE_WIDTH + (sx + 0x800)];
 
       // To avoid ambiguity there can only be one valid entry per-session
       if (0) //(IsSessionID(pOldVertex->count) && (pOldVertex->value == pNewVertex->value))
@@ -664,36 +693,46 @@ void PGXP_CacheVertex(short sx, short sy, const PGXP_value* _pVertex)
 
 PGXP_value* PGXP_GetCachedVertex(short sx, short sy)
 {
-  // if (bGteAccuracy)
+  if (g_settings.gpu_pgxp_vertex_cache)
   {
     if (cacheMode != mode_read)
     {
       if (cacheMode == mode_fail)
         return NULL;
 
-      // Initialise cache on first use
-      if (cacheMode == mode_init)
-        memset(vertexCache, 0x00, sizeof(vertexCache));
-
       // First vertex of read session (frame?)
       cacheMode = mode_read;
     }
 
+    // Initialise cache on first use
+    if (!vertexCache)
+      InitPGXPVertexCache();
+
     if (sx >= -0x800 && sx <= 0x7ff && sy >= -0x800 && sy <= 0x7ff)
     {
       // Return pointer to cache entry
-      return &vertexCache[sy + 0x800][sx + 0x800];
+      return &vertexCache[(sy + 0x800) * VERTEX_CACHE_WIDTH + (sx + 0x800)];
     }
   }
 
   return NULL;
 }
 
-static float TruncateVertexPosition(float p)
+static ALWAYS_INLINE_RELEASE float TruncateVertexPosition(float p)
 {
   const s32 int_part = static_cast<s32>(p);
   const float int_part_f = static_cast<float>(int_part);
   return static_cast<float>(static_cast<s16>(int_part << 5) >> 5) + (p - int_part_f);
+}
+
+static ALWAYS_INLINE_RELEASE bool IsWithinTolerance(float precise_x, float precise_y, int int_x, int int_y)
+{
+  const float tolerance = g_settings.gpu_pgxp_tolerance;
+  if (tolerance < 0.0f)
+    return true;
+
+  return (std::abs(precise_x - static_cast<float>(int_x)) <= tolerance &&
+          std::abs(precise_y - static_cast<float>(int_y)) <= tolerance);
 }
 
 bool GetPreciseVertex(u32 addr, u32 value, int x, int y, int xOffs, int yOffs, float* out_x, float* out_y, float* out_w)
@@ -705,9 +744,11 @@ bool GetPreciseVertex(u32 addr, u32 value, int x, int y, int xOffs, int yOffs, f
     *out_x = TruncateVertexPosition(vert->x) + static_cast<float>(xOffs);
     *out_y = TruncateVertexPosition(vert->y) + static_cast<float>(yOffs);
     *out_w = vert->z / 32768.0f;
-
-    // This value does not have a valid W coordinate
-    return ((vert->flags & VALID_2) == VALID_2);
+    if (IsWithinTolerance(*out_x, *out_y, x, y))
+    {
+      // check validity of z component
+      return ((vert->flags & VALID_2) == VALID_2);
+    }
   }
   else
   {
@@ -723,18 +764,20 @@ bool GetPreciseVertex(u32 addr, u32 value, int x, int y, int xOffs, int yOffs, f
       *out_x = TruncateVertexPosition(vert->x) + static_cast<float>(xOffs);
       *out_y = TruncateVertexPosition(vert->y) + static_cast<float>(yOffs);
       *out_w = vert->z / 32768.0f;
-      return false; // iCB: Getting the wrong w component causes too great an error when using perspective correction
-                    // so disable it
-    }
-    else
-    {
-      // no valid value can be found anywhere, use the native PSX data
-      *out_x = static_cast<float>(x);
-      *out_y = static_cast<float>(y);
-      *out_w = 1.0f;
-      return false;
+
+      if (IsWithinTolerance(*out_x, *out_y, x, y))
+      {
+        return false; // iCB: Getting the wrong w component causes too great an error when using perspective correction
+                      // so disable it
+      }
     }
   }
+
+  // no valid value can be found anywhere, use the native PSX data
+  *out_x = static_cast<float>(x);
+  *out_y = static_cast<float>(y);
+  *out_w = 1.0f;
+  return false;
 }
 
 // pgxp_cpu.c
@@ -840,6 +883,13 @@ void CPU_SW(u32 instr, u32 rtVal, u32 addr)
   WriteMem(&CPU_reg[rt(instr)], addr);
 }
 
+void CPU_MOVE(u32 rd_and_rs, u32 rsVal)
+{
+  const u32 Rs = (rd_and_rs & 0xFFu);
+  Validate(&CPU_reg[Rs], rsVal);
+  CPU_reg[(rd_and_rs >> 8)] = CPU_reg[Rs];
+}
+
 void CPU_ADDI(u32 instr, u32 rtVal, u32 rsVal)
 {
   // Rt = Rs + Imm (signed)
@@ -851,17 +901,20 @@ void CPU_ADDI(u32 instr, u32 rtVal, u32 rsVal)
   tempImm.d = imm(instr);
   tempImm.sd = (tempImm.sd << 16) >> 16; // sign extend
 
-  ret.x = (float)f16Unsign(ret.x);
-  ret.x += (float)tempImm.w.l;
+  if (tempImm.d != 0)
+  {
+    ret.x = (float)f16Unsign(ret.x);
+    ret.x += (float)tempImm.w.l;
 
-  // carry on over/underflow
-  float of = (ret.x > USHRT_MAX) ? 1.f : (ret.x < 0) ? -1.f : 0.f;
-  ret.x = (float)f16Sign(ret.x);
-  // ret.x -= of * (USHRT_MAX + 1);
-  ret.y += tempImm.sw.h + of;
+    // carry on over/underflow
+    float of = (ret.x > USHRT_MAX) ? 1.f : (ret.x < 0) ? -1.f : 0.f;
+    ret.x = (float)f16Sign(ret.x);
+    // ret.x -= of * (USHRT_MAX + 1);
+    ret.y += tempImm.sw.h + of;
 
-  // truncate on overflow/underflow
-  ret.y += (ret.y > SHRT_MAX) ? -(USHRT_MAX + 1) : (ret.y < SHRT_MIN) ? USHRT_MAX + 1 : 0.f;
+    // truncate on overflow/underflow
+    ret.y += (ret.y > SHRT_MAX) ? -(USHRT_MAX + 1) : (ret.y < SHRT_MIN) ? USHRT_MAX + 1 : 0.f;
+  }
 
   CPU_reg[rt(instr)] = ret;
   CPU_reg[rt(instr)].value = rtVal;
@@ -1019,33 +1072,40 @@ void CPU_ADD(u32 instr, u32 rdVal, u32 rsVal, u32 rtVal)
   Validate(&CPU_reg[rs(instr)], rsVal);
   Validate(&CPU_reg[rt(instr)], rtVal);
 
-  // iCB: Only require one valid input
-  if (((CPU_reg[rt(instr)].flags & VALID_01) != VALID_01) != ((CPU_reg[rs(instr)].flags & VALID_01) != VALID_01))
+  if (rtVal != 0)
   {
-    MakeValid(&CPU_reg[rs(instr)], rsVal);
-    MakeValid(&CPU_reg[rt(instr)], rtVal);
+    // iCB: Only require one valid input
+    if (((CPU_reg[rt(instr)].flags & VALID_01) != VALID_01) != ((CPU_reg[rs(instr)].flags & VALID_01) != VALID_01))
+    {
+      MakeValid(&CPU_reg[rs(instr)], rsVal);
+      MakeValid(&CPU_reg[rt(instr)], rtVal);
+    }
+
+    ret = CPU_reg[rs(instr)];
+
+    ret.x = (float)f16Unsign(ret.x);
+    ret.x += (float)f16Unsign(CPU_reg[rt(instr)].x);
+
+    // carry on over/underflow
+    float of = (ret.x > USHRT_MAX) ? 1.f : (ret.x < 0) ? -1.f : 0.f;
+    ret.x = (float)f16Sign(ret.x);
+    // ret.x -= of * (USHRT_MAX + 1);
+    ret.y += CPU_reg[rt(instr)].y + of;
+
+    // truncate on overflow/underflow
+    ret.y += (ret.y > SHRT_MAX) ? -(USHRT_MAX + 1) : (ret.y < SHRT_MIN) ? USHRT_MAX + 1 : 0.f;
+
+    // TODO: decide which "z/w" component to use
+
+    ret.halfFlags[0] &= CPU_reg[rt(instr)].halfFlags[0];
+    ret.gFlags |= CPU_reg[rt(instr)].gFlags;
+    ret.lFlags |= CPU_reg[rt(instr)].lFlags;
+    ret.hFlags |= CPU_reg[rt(instr)].hFlags;
   }
-
-  ret = CPU_reg[rs(instr)];
-
-  ret.x = (float)f16Unsign(ret.x);
-  ret.x += (float)f16Unsign(CPU_reg[rt(instr)].x);
-
-  // carry on over/underflow
-  float of = (ret.x > USHRT_MAX) ? 1.f : (ret.x < 0) ? -1.f : 0.f;
-  ret.x = (float)f16Sign(ret.x);
-  // ret.x -= of * (USHRT_MAX + 1);
-  ret.y += CPU_reg[rt(instr)].y + of;
-
-  // truncate on overflow/underflow
-  ret.y += (ret.y > SHRT_MAX) ? -(USHRT_MAX + 1) : (ret.y < SHRT_MIN) ? USHRT_MAX + 1 : 0.f;
-
-  // TODO: decide which "z/w" component to use
-
-  ret.halfFlags[0] &= CPU_reg[rt(instr)].halfFlags[0];
-  ret.gFlags |= CPU_reg[rt(instr)].gFlags;
-  ret.lFlags |= CPU_reg[rt(instr)].lFlags;
-  ret.hFlags |= CPU_reg[rt(instr)].hFlags;
+  else
+  {
+    ret = CPU_reg[rs(instr)];
+  }
 
   ret.value = rdVal;
 

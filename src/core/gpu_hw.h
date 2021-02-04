@@ -32,9 +32,9 @@ public:
   virtual bool IsHardwareRenderer() const override;
 
   virtual bool Initialize(HostDisplay* host_display) override;
-  virtual void Reset() override;
-  virtual bool DoState(StateWrapper& sw) override;
-  
+  virtual void Reset(bool clear_vram) override;
+  virtual bool DoState(StateWrapper& sw, HostDisplayTexture** host_texture, bool update_display) override;
+
   void UpdateResolutionScale() override final;
   std::tuple<u32, u32> GetEffectiveDisplayResolution() override final;
 
@@ -94,33 +94,34 @@ protected:
 
   struct BatchConfig
   {
-    TextureMode texture_mode;
-    TransparencyMode transparency_mode;
+    GPUTextureMode texture_mode;
+    GPUTransparencyMode transparency_mode;
     bool dithering;
     bool interlacing;
     bool set_mask_while_drawing;
     bool check_mask_before_draw;
+    bool use_depth_buffer;
 
     // We need two-pass rendering when using BG-FG blending and texturing, as the transparency can be enabled
     // on a per-pixel basis, and the opaque pixels shouldn't be blended at all.
     bool NeedsTwoPassRendering() const
     {
-      return transparency_mode == GPU::TransparencyMode::BackgroundMinusForeground &&
-             texture_mode != TextureMode::Disabled;
+      return transparency_mode == GPUTransparencyMode::BackgroundMinusForeground &&
+             texture_mode != GPUTextureMode::Disabled;
     }
 
     // Returns the render mode for this batch.
     BatchRenderMode GetRenderMode() const
     {
-      return transparency_mode == TransparencyMode::Disabled ? BatchRenderMode::TransparencyDisabled :
-                                                               BatchRenderMode::TransparentAndOpaque;
+      return transparency_mode == GPUTransparencyMode::Disabled ? BatchRenderMode::TransparencyDisabled :
+                                                                  BatchRenderMode::TransparentAndOpaque;
     }
   };
 
   struct BatchUBOData
   {
-    u32 u_texture_window_mask[2];
-    u32 u_texture_window_offset[2];
+    u32 u_texture_window_and[2];
+    u32 u_texture_window_or[2];
     float u_src_alpha_factor;
     float u_dst_alpha_factor;
     u32 u_interlaced_displayed_field;
@@ -179,6 +180,7 @@ protected:
 
   virtual void UpdateVRAMReadTexture();
   virtual void UpdateDepthBufferFromMaskBit() = 0;
+  virtual void ClearDepthBuffer() = 0;
   virtual void SetScissorFromDrawingArea() = 0;
   virtual void MapBatchVertexPointer(u32 required_vertices) = 0;
   virtual void UnmapBatchVertexPointer(u32 used_vertices) = 0;
@@ -186,6 +188,13 @@ protected:
   virtual void DrawBatchVertices(BatchRenderMode render_mode, u32 base_vertex, u32 num_vertices) = 0;
 
   u32 CalculateResolutionScale() const;
+  GPUDownsampleMode GetDownsampleMode(u32 resolution_scale) const;
+
+  ALWAYS_INLINE bool IsUsingMultisampling() const { return m_multisamples > 1; }
+  ALWAYS_INLINE bool IsUsingDownsampling() const
+  {
+    return (m_downsample_mode != GPUDownsampleMode::Disabled && !m_GPUSTAT.display_area_color_depth_24);
+  }
 
   void SetFullVRAMDirtyRectangle()
   {
@@ -223,8 +232,30 @@ protected:
     }
   }
 
+  /// Returns true if the specified texture filtering mode requires dual-source blending.
+  ALWAYS_INLINE bool TextureFilterRequiresDualSourceBlend(GPUTextureFilter filter)
+  {
+    return (filter == GPUTextureFilter::Bilinear || filter == GPUTextureFilter::JINC2 ||
+            filter == GPUTextureFilter::xBR);
+  }
+
+  /// Returns true if alpha blending should be enabled for drawing the current batch.
+  ALWAYS_INLINE bool UseAlphaBlending(GPUTransparencyMode transparency_mode, BatchRenderMode render_mode) const
+  {
+    if (m_texture_filtering == GPUTextureFilter::Bilinear || m_texture_filtering == GPUTextureFilter::JINC2 ||
+        m_texture_filtering == GPUTextureFilter::xBR)
+    {
+      return true;
+    }
+
+    if (transparency_mode == GPUTransparencyMode::Disabled || render_mode == BatchRenderMode::OnlyOpaque)
+      return false;
+
+    return true;
+  }
+
   void FillVRAM(u32 x, u32 y, u32 width, u32 height, u32 color) override;
-  void UpdateVRAM(u32 x, u32 y, u32 width, u32 height, const void* data) override;
+  void UpdateVRAM(u32 x, u32 y, u32 width, u32 height, const void* data, bool set_mask, bool check_mask) override;
   void CopyVRAM(u32 src_x, u32 src_y, u32 dst_x, u32 dst_y, u32 width, u32 height) override;
   void DispatchRenderCommand() override;
   void FlushRender() override;
@@ -244,7 +275,8 @@ protected:
   bool UseVRAMCopyShader(u32 src_x, u32 src_y, u32 dst_x, u32 dst_y, u32 width, u32 height) const;
 
   VRAMFillUBOData GetVRAMFillUBOData(u32 x, u32 y, u32 width, u32 height, u32 color) const;
-  VRAMWriteUBOData GetVRAMWriteUBOData(u32 x, u32 y, u32 width, u32 height, u32 buffer_offset) const;
+  VRAMWriteUBOData GetVRAMWriteUBOData(u32 x, u32 y, u32 width, u32 height, u32 buffer_offset, bool set_mask,
+                                       bool check_mask) const;
   VRAMCopyUBOData GetVRAMCopyUBOData(u32 src_x, u32 src_y, u32 dst_x, u32 dst_y, u32 width, u32 height) const;
 
   /// Expands a line into two triangles.
@@ -255,7 +287,25 @@ protected:
 
   /// Computes polygon U/V boundaries.
   static void ComputePolygonUVLimits(BatchVertex* vertices, u32 num_vertices);
-  static bool AreUVLimitsNeeded();
+
+  /// Sets the depth test flag for PGXP depth buffering.
+  void SetBatchDepthBuffer(bool enabled);
+  void CheckForDepthClear(const BatchVertex* vertices, u32 num_vertices);
+
+  /// UBO data for adaptive smoothing.
+  struct SmoothingUBOData
+  {
+    float min_uv[2];
+    float max_uv[2];
+    float rcp_size[2];
+  };
+
+  /// Returns the number of mipmap levels used for adaptive smoothing.
+  u32 GetAdaptiveDownsamplingMipLevels() const;
+
+  /// Returns the UBO data for an adaptive smoothing pass.
+  SmoothingUBOData GetSmoothingUBO(u32 level, u32 left, u32 top, u32 width, u32 height, u32 tex_width,
+                                   u32 tex_height) const;
 
   HeapArray<u16, VRAM_WIDTH * VRAM_HEIGHT> m_vram_shadow;
 
@@ -264,15 +314,31 @@ protected:
   BatchVertex* m_batch_current_vertex_ptr = nullptr;
   u32 m_batch_base_vertex = 0;
   s32 m_current_depth = 0;
+  float m_last_depth_z = 1.0f;
 
   u32 m_resolution_scale = 1;
+  u32 m_multisamples = 1;
   u32 m_max_resolution_scale = 1;
+  u32 m_max_multisamples = 1;
   HostDisplay::RenderAPI m_render_api = HostDisplay::RenderAPI::None;
   bool m_true_color = true;
-  bool m_scaled_dithering = false;
-  bool m_texture_filtering = false;
-  bool m_supports_dual_source_blend = false;
+
+  union
+  {
+    BitField<u8, bool, 0, 1> m_supports_per_sample_shading;
+    BitField<u8, bool, 1, 1> m_supports_dual_source_blend;
+    BitField<u8, bool, 2, 1> m_supports_adaptive_downsampling;
+    BitField<u8, bool, 3, 1> m_per_sample_shading;
+    BitField<u8, bool, 4, 1> m_scaled_dithering;
+    BitField<u8, bool, 5, 1> m_chroma_smoothing;
+
+    u8 bits = 0;
+  };
+
+  GPUTextureFilter m_texture_filtering = GPUTextureFilter::Nearest;
+  GPUDownsampleMode m_downsample_mode = GPUDownsampleMode::Disabled;
   bool m_using_uv_limits = false;
+  bool m_pgxp_depth_buffer = false;
 
   BatchConfig m_batch = {};
   BatchUBOData m_batch_ubo_data = {};

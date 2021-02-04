@@ -28,7 +28,7 @@ Log_SetChannel(AutoUpdaterDialog);
 #ifdef WIN32
 #if defined(__has_include) && __has_include("scmversion/tag.h")
 #include "scmversion/tag.h"
-#ifdef SCM_RELEASE_TAG
+#ifdef SCM_RELEASE_TAGS
 #define AUTO_UPDATER_SUPPORTED
 #endif
 #endif
@@ -36,11 +36,12 @@ Log_SetChannel(AutoUpdaterDialog);
 
 #ifdef AUTO_UPDATER_SUPPORTED
 
-static constexpr char LATEST_TAG_URL[] = "https://api.github.com/repos/stenzek/duckstation/tags";
-static constexpr char LATEST_RELEASE_URL[] =
-  "https://api.github.com/repos/stenzek/duckstation/releases/tags/" SCM_RELEASE_TAG;
-static constexpr char CHANGES_URL[] = "https://api.github.com/repos/stenzek/duckstation/compare/%s..." SCM_RELEASE_TAG;
-static constexpr char UPDATE_ASSET_FILENAME[] = SCM_RELEASE_ASSET;
+static constexpr char* LATEST_TAG_URL = "https://api.github.com/repos/stenzek/duckstation/tags";
+static constexpr char* LATEST_RELEASE_URL = "https://api.github.com/repos/stenzek/duckstation/releases/tags/%s";
+static constexpr char* CHANGES_URL = "https://api.github.com/repos/stenzek/duckstation/compare/%s...%s";
+static constexpr char* UPDATE_ASSET_FILENAME = SCM_RELEASE_ASSET;
+static constexpr char* UPDATE_TAGS[] = SCM_RELEASE_TAGS;
+static constexpr char* THIS_RELEASE_TAG = SCM_RELEASE_TAG;
 
 #endif
 
@@ -52,9 +53,6 @@ AutoUpdaterDialog::AutoUpdaterDialog(QtHostInterface* host_interface, QWidget* p
   m_ui.setupUi(this);
 
   setWindowFlags(windowFlags() & ~Qt::WindowContextHelpButtonHint);
-
-  // m_ui.description->setTextInteractionFlags(Qt::TextBrowserInteraction);
-  // m_ui.description->setOpenExternalLinks(true);
 
   connect(m_ui.downloadAndInstall, &QPushButton::clicked, this, &AutoUpdaterDialog::downloadUpdateClicked);
   connect(m_ui.skipThisUpdate, &QPushButton::clicked, this, &AutoUpdaterDialog::skipThisUpdateClicked);
@@ -69,6 +67,33 @@ bool AutoUpdaterDialog::isSupported()
   return true;
 #else
   return false;
+#endif
+}
+
+QStringList AutoUpdaterDialog::getTagList()
+{
+#ifdef AUTO_UPDATER_SUPPORTED
+  return QStringList(std::begin(UPDATE_TAGS), std::end(UPDATE_TAGS));
+#else
+  return QStringList();
+#endif
+}
+
+std::string AutoUpdaterDialog::getDefaultTag()
+{
+#ifdef AUTO_UPDATER_SUPPORTED
+  return THIS_RELEASE_TAG;
+#else
+  return {};
+#endif
+}
+
+std::string AutoUpdaterDialog::getCurrentUpdateTag() const
+{
+#ifdef AUTO_UPDATER_SUPPORTED
+  return m_host_interface->GetStringSettingValue("AutoUpdater", "UpdateTag", THIS_RELEASE_TAG);
+#else
+  return {};
 #endif
 }
 
@@ -89,7 +114,7 @@ void AutoUpdaterDialog::queueUpdateCheck(bool display_message)
 #ifdef AUTO_UPDATER_SUPPORTED
   connect(m_network_access_mgr, &QNetworkAccessManager::finished, this, &AutoUpdaterDialog::getLatestTagComplete);
 
-  QUrl url(QUrl::fromEncoded(QByteArray(LATEST_TAG_URL, sizeof(LATEST_TAG_URL) - 1)));
+  QUrl url(QUrl::fromEncoded(QByteArray(LATEST_TAG_URL)));
   QNetworkRequest request(url);
   request.setAttribute(QNetworkRequest::FollowRedirectsAttribute, true);
   m_network_access_mgr->get(request);
@@ -103,7 +128,10 @@ void AutoUpdaterDialog::queueGetLatestRelease()
 #ifdef AUTO_UPDATER_SUPPORTED
   connect(m_network_access_mgr, &QNetworkAccessManager::finished, this, &AutoUpdaterDialog::getLatestReleaseComplete);
 
-  QUrl url(QUrl::fromEncoded(QByteArray(LATEST_RELEASE_URL, sizeof(LATEST_RELEASE_URL) - 1)));
+  SmallString url_string;
+  url_string.Format(LATEST_RELEASE_URL, getCurrentUpdateTag().c_str());
+
+  QUrl url(QUrl::fromEncoded(QByteArray(url_string)));
   QNetworkRequest request(url);
   request.setAttribute(QNetworkRequest::FollowRedirectsAttribute, true);
   m_network_access_mgr->get(request);
@@ -113,6 +141,9 @@ void AutoUpdaterDialog::queueGetLatestRelease()
 void AutoUpdaterDialog::getLatestTagComplete(QNetworkReply* reply)
 {
 #ifdef AUTO_UPDATER_SUPPORTED
+  const std::string selected_tag(getCurrentUpdateTag());
+  const QString selected_tag_qstr = QString::fromStdString(selected_tag);
+
   // this might fail due to a lack of internet connection - in which case, don't spam the user with messages every time.
   m_network_access_mgr->disconnect(this);
   reply->deleteLater();
@@ -130,7 +161,7 @@ void AutoUpdaterDialog::getLatestTagComplete(QNetworkReply* reply)
         if (!val.isObject())
           continue;
 
-        if (val["name"].toString() != QStringLiteral(SCM_RELEASE_TAG))
+        if (val["name"].toString() != selected_tag_qstr)
           continue;
 
         m_latest_sha = val["commit"].toObject()["sha"].toString();
@@ -153,7 +184,7 @@ void AutoUpdaterDialog::getLatestTagComplete(QNetworkReply* reply)
       }
 
       if (m_display_messages)
-        reportError("latest release not found in JSON");
+        reportError("%s release not found in JSON", selected_tag.c_str());
     }
     else
     {
@@ -197,6 +228,7 @@ void AutoUpdaterDialog::getLatestReleaseComplete(QNetworkReply* reply)
           m_download_url = asset_obj["browser_download_url"].toString();
           if (!m_download_url.isEmpty())
           {
+            m_download_size = asset_obj["size"].toInt();
             m_ui.currentVersion->setText(tr("Current Version: %1 (%2)").arg(g_scm_hash_str).arg(g_scm_date_str));
             m_ui.newVersion->setText(
               tr("New Version: %1 (%2)").arg(m_latest_sha).arg(doc_object["published_at"].toString()));
@@ -230,7 +262,8 @@ void AutoUpdaterDialog::queueGetChanges()
 #ifdef AUTO_UPDATER_SUPPORTED
   connect(m_network_access_mgr, &QNetworkAccessManager::finished, this, &AutoUpdaterDialog::getChangesComplete);
 
-  const std::string url_string(StringUtil::StdStringFromFormat(CHANGES_URL, g_scm_hash_str));
+  const std::string url_string(
+    StringUtil::StdStringFromFormat(CHANGES_URL, g_scm_hash_str, getCurrentUpdateTag().c_str()));
   QUrl url(QUrl::fromEncoded(QByteArray(url_string.c_str(), static_cast<int>(url_string.size()))));
   QNetworkRequest request(url);
   request.setAttribute(QNetworkRequest::FollowRedirectsAttribute, true);
@@ -253,9 +286,13 @@ void AutoUpdaterDialog::getChangesComplete(QNetworkReply* reply)
     {
       const QJsonObject doc_object(doc.object());
 
-      QString changes_html = QStringLiteral("<ul>");
+      QString changes_html = tr("<h2>Changes:</h2>");
+      changes_html += QStringLiteral("<ul>");
 
       const QJsonArray commits(doc_object["commits"].toArray());
+      bool update_will_break_save_states = false;
+      bool update_increases_settings_version = false;
+
       for (const QJsonValue& commit : commits)
       {
         const QJsonObject commit_obj(commit["commit"].toObject());
@@ -266,11 +303,37 @@ void AutoUpdaterDialog::getChangesComplete(QNetworkReply* reply)
         if (first_line_terminator >= 0)
           message.remove(first_line_terminator, message.size() - first_line_terminator);
         if (!message.isEmpty())
+        {
           changes_html +=
             QStringLiteral("<li>%1 <i>(%2)</i></li>").arg(message.toHtmlEscaped()).arg(author.toHtmlEscaped());
+        }
+
+        if (message.contains(QStringLiteral("[SAVEVERSION+]")))
+          update_will_break_save_states = true;
+
+        if (message.contains(QStringLiteral("[SETTINGSVERSION+]")))
+          update_increases_settings_version = true;
       }
 
       changes_html += "</ul>";
+
+      if (update_will_break_save_states)
+      {
+        changes_html.prepend(tr("<h2>Save State Warning</h2><p>Installing this update will make your save states "
+                                "<b>incompatible</b>. Please ensure you have saved your games to memory card "
+                                "before installing this update or you will lose progress.</p>"));
+      }
+
+      if (update_increases_settings_version)
+      {
+        changes_html.prepend(
+          tr("<h2>Settings Warning</h2><p>Installing this update will reset your program configuration. Please note "
+             "that you will have to reconfigure your settings after this update.</p>"));
+      }
+
+      changes_html += tr("<h4>Installing this update will download %1 MB through your internet connection.</h4>")
+                        .arg(static_cast<double>(m_download_size) / 1000000.0, 0, 'f', 2);
+
       m_ui.updateNotes->setText(changes_html);
     }
     else

@@ -2,15 +2,15 @@
 #include "common/assert.h"
 #include "common/audio_stream.h"
 #include "common/byte_stream.h"
+#include "common/crash_handler.h"
 #include "common/file_system.h"
 #include "common/log.h"
 #include "common/string_util.h"
 #include "controller_interface.h"
 #include "core/cdrom.h"
-#include "core/controller.h"
+#include "core/cheats.h"
 #include "core/cpu_code_cache.h"
 #include "core/dma.h"
-#include "core/game_list.h"
 #include "core/gpu.h"
 #include "core/host_display.h"
 #include "core/mdec.h"
@@ -18,7 +18,12 @@
 #include "core/save_state_version.h"
 #include "core/spu.h"
 #include "core/system.h"
+#include "core/texture_replacements.h"
 #include "core/timers.h"
+#include "cubeb_audio_stream.h"
+#include "fullscreen_ui.h"
+#include "game_list.h"
+#include "icon.h"
 #include "imgui.h"
 #include "ini_settings_interface.h"
 #include "save_state_selector_ui.h"
@@ -61,6 +66,9 @@ bool CommonHostInterface::Initialize()
   if (!FileSystem::SetWorkingDirectory(m_user_directory.c_str()))
     Log_ErrorPrintf("Failed to set working directory to '%s'", m_user_directory.c_str());
 
+  // Set crash handler to dump to user directory, because of permissions.
+  CrashHandler::SetWriteDirectory(m_user_directory);
+
   LoadSettings();
   UpdateLogSettings(g_settings.log_level, g_settings.log_filter.empty() ? nullptr : g_settings.log_filter.c_str(),
                     g_settings.log_to_console, g_settings.log_to_debug, g_settings.log_to_window,
@@ -68,17 +76,13 @@ bool CommonHostInterface::Initialize()
 
   m_game_list = std::make_unique<GameList>();
   m_game_list->SetCacheFilename(GetUserDirectoryRelativePath("cache/gamelist.cache"));
-  m_game_list->SetDatabaseFilename(GetUserDirectoryRelativePath("cache/redump.dat"));
-  m_game_list->SetCompatibilityFilename(GetProgramDirectoryRelativePath("database/compatibility.xml"));
-  m_game_list->SetGameSettingsFilename(GetProgramDirectoryRelativePath("database/gamesettings.ini"));
+  m_game_list->SetUserDatabaseFilename(GetUserDirectoryRelativePath("redump.dat"));
+  m_game_list->SetUserCompatibilityListFilename(GetUserDirectoryRelativePath("compatibility.xml"));
   m_game_list->SetUserGameSettingsFilename(GetUserDirectoryRelativePath("gamesettings.ini"));
 
   m_save_state_selector_ui = std::make_unique<FrontendCommon::SaveStateSelectorUI>(this);
 
-  RegisterGeneralHotkeys();
-  RegisterGraphicsHotkeys();
-  RegisterSaveStateHotkeys();
-  RegisterAudioHotkeys();
+  RegisterHotkeys();
 
   UpdateControllerInterface();
   return true;
@@ -88,17 +92,9 @@ void CommonHostInterface::Shutdown()
 {
   HostInterface::Shutdown();
 
-  // this has gpu objects so it has to come first
-  m_save_state_selector_ui.reset();
-
 #ifdef WITH_DISCORD_PRESENCE
   ShutdownDiscordPresence();
 #endif
-
-  System::Shutdown();
-  m_audio_stream.reset();
-  if (m_display)
-    ReleaseHostDisplay();
 
   if (m_controller_interface)
   {
@@ -125,12 +121,17 @@ void CommonHostInterface::InitializeUserDirectory()
 
   result &= FileSystem::CreateDirectory(GetUserDirectoryRelativePath("bios").c_str(), false);
   result &= FileSystem::CreateDirectory(GetUserDirectoryRelativePath("cache").c_str(), false);
+  result &= FileSystem::CreateDirectory(GetUserDirectoryRelativePath("cheats").c_str(), false);
+  result &= FileSystem::CreateDirectory(GetUserDirectoryRelativePath("covers").c_str(), false);
   result &= FileSystem::CreateDirectory(GetUserDirectoryRelativePath("dump").c_str(), false);
   result &= FileSystem::CreateDirectory(GetUserDirectoryRelativePath("dump/audio").c_str(), false);
+  result &= FileSystem::CreateDirectory(GetUserDirectoryRelativePath("dump/textures").c_str(), false);
   result &= FileSystem::CreateDirectory(GetUserDirectoryRelativePath("inputprofiles").c_str(), false);
+  result &= FileSystem::CreateDirectory(GetUserDirectoryRelativePath("memcards").c_str(), false);
   result &= FileSystem::CreateDirectory(GetUserDirectoryRelativePath("savestates").c_str(), false);
   result &= FileSystem::CreateDirectory(GetUserDirectoryRelativePath("screenshots").c_str(), false);
-  result &= FileSystem::CreateDirectory(GetUserDirectoryRelativePath("memcards").c_str(), false);
+  result &= FileSystem::CreateDirectory(GetUserDirectoryRelativePath("shaders").c_str(), false);
+  result &= FileSystem::CreateDirectory(GetUserDirectoryRelativePath("textures").c_str(), false);
 
   if (!result)
     ReportError("Failed to create one or more user directories. This may cause issues at runtime.");
@@ -141,7 +142,7 @@ bool CommonHostInterface::BootSystem(const SystemBootParameters& parameters)
   if (!HostInterface::BootSystem(parameters))
   {
     // if in batch mode, exit immediately if booting failed
-    if (m_batch_mode)
+    if (InBatchMode())
       RequestExit();
 
     return false;
@@ -161,35 +162,23 @@ bool CommonHostInterface::BootSystem(const SystemBootParameters& parameters)
   return true;
 }
 
-void CommonHostInterface::PauseSystem(bool paused)
-{
-  if (paused == System::IsPaused() || System::IsShutdown())
-    return;
-
-  System::SetState(paused ? System::State::Paused : System::State::Running);
-  m_audio_stream->PauseOutput(paused);
-  OnSystemPaused(paused);
-  UpdateSpeedLimiterState();
-
-  if (!paused)
-    System::ResetPerformanceCounters();
-}
-
 void CommonHostInterface::DestroySystem()
 {
   SetTimerResolutionIncreased(false);
+  m_save_state_selector_ui->Close();
+  m_display->SetPostProcessingChain({});
 
   HostInterface::DestroySystem();
 }
 
 void CommonHostInterface::PowerOffSystem()
 {
-  if (g_settings.save_state_on_exit)
-    SaveResumeSaveState();
+  if (System::IsShutdown())
+    return;
 
   HostInterface::PowerOffSystem();
 
-  if (m_batch_mode)
+  if (InBatchMode())
     RequestExit();
 }
 
@@ -232,6 +221,11 @@ static void PrintCommandLineHelp(const char* progname, const char* frontend_name
   std::fprintf(stderr, "  -fullscreen: Enters fullscreen mode immediately after starting.\n");
   std::fprintf(stderr, "  -nofullscreen: Prevents fullscreen mode from triggering if enabled.\n");
   std::fprintf(stderr, "  -portable: Forces \"portable mode\", data in same directory.\n");
+  std::fprintf(stderr, "  -nocontroller: Prevents the emulator from polling for controllers.\n"
+                       "                 Try this option if you're having difficulties starting\n"
+                       "                 the emulator.\n");
+  std::fprintf(stderr, "  -settings <filename>: Loads a custom settings configuration from the\n"
+                       "    specified filename. Default settings applied if file not found.\n");
   std::fprintf(stderr, "  --: Signals that no more arguments will follow and the remaining\n"
                        "    parameters make up the filename. Use when the filename contains\n"
                        "    spaces or starts with a dash.\n");
@@ -271,7 +265,7 @@ bool CommonHostInterface::ParseCommandLineParameters(int argc, char* argv[],
       else if (CHECK_ARG("-batch"))
       {
         Log_InfoPrintf("Enabling batch mode.");
-        m_batch_mode = true;
+        m_command_line_flags.batch_mode = true;
         continue;
       }
       else if (CHECK_ARG("-fastboot"))
@@ -284,6 +278,12 @@ bool CommonHostInterface::ParseCommandLineParameters(int argc, char* argv[],
       {
         Log_InfoPrintf("Forcing slow boot.");
         force_fast_boot = false;
+        continue;
+      }
+      else if (CHECK_ARG("-nocontroller"))
+      {
+        Log_InfoPrintf("Disabling controller support.");
+        m_command_line_flags.disable_controller_interface = true;
         continue;
       }
       else if (CHECK_ARG("-resume"))
@@ -304,6 +304,7 @@ bool CommonHostInterface::ParseCommandLineParameters(int argc, char* argv[],
       else if (CHECK_ARG("-fullscreen"))
       {
         Log_InfoPrintf("Going fullscreen after booting.");
+        m_command_line_flags.start_fullscreen = true;
         force_fullscreen = true;
         continue;
       }
@@ -322,6 +323,11 @@ bool CommonHostInterface::ParseCommandLineParameters(int argc, char* argv[],
       else if (CHECK_ARG_PARAM("-resume"))
       {
         state_index = -1;
+        continue;
+      }
+      else if (CHECK_ARG_PARAM("-settings"))
+      {
+        m_settings_filename = argv[++i];
         continue;
       }
       else if (CHECK_ARG("--"))
@@ -369,7 +375,7 @@ bool CommonHostInterface::ParseCommandLineParameters(int argc, char* argv[],
       else
       {
         // find the game id, and get its save state path
-        std::string game_code = m_game_list->GetGameCodeForPath(boot_filename.c_str());
+        std::string game_code = System::GetGameCodeForPath(boot_filename.c_str());
         if (game_code.empty())
         {
           Log_WarningPrintf("Could not identify game code for '%s', cannot load save state %d.", boot_filename.c_str(),
@@ -380,8 +386,15 @@ bool CommonHostInterface::ParseCommandLineParameters(int argc, char* argv[],
           state_filename = GetGameSaveStateFileName(game_code.c_str(), *state_index);
           if (state_filename.empty() || !FileSystem::FileExists(state_filename.c_str()))
           {
-            Log_ErrorPrintf("Could not find file for game '%s' save state %d", game_code.c_str(), *state_index);
-            return false;
+            if (state_index >= 0) // Do not exit if -resume is specified, but resume save state does not exist
+            {
+              Log_ErrorPrintf("Could not find file for game '%s' save state %d", game_code.c_str(), *state_index);
+              return false;
+            }
+            else
+            {
+              state_filename.clear();
+            }
           }
         }
       }
@@ -428,6 +441,21 @@ bool CommonHostInterface::SetFullscreen(bool enabled)
   return false;
 }
 
+bool CommonHostInterface::CreateHostDisplayResources()
+{
+  m_logo_texture = m_display->CreateTexture(APP_ICON_WIDTH, APP_ICON_HEIGHT, 1, 1, 1, HostDisplayPixelFormat::RGBA8,
+                                            APP_ICON_DATA, sizeof(u32) * APP_ICON_WIDTH, false);
+  if (!m_logo_texture)
+    Log_WarningPrintf("Failed to create logo texture");
+
+  return true;
+}
+
+void CommonHostInterface::ReleaseHostDisplayResources()
+{
+  m_logo_texture.reset();
+}
+
 std::unique_ptr<AudioStream> CommonHostInterface::CreateAudioStream(AudioBackend backend)
 {
   switch (backend)
@@ -436,7 +464,7 @@ std::unique_ptr<AudioStream> CommonHostInterface::CreateAudioStream(AudioBackend
       return AudioStream::CreateNullAudioStream();
 
     case AudioBackend::Cubeb:
-      return AudioStream::CreateCubebAudioStream();
+      return CubebAudioStream::Create();
 
 #ifdef WITH_SDL2
     case AudioBackend::SDL:
@@ -448,6 +476,11 @@ std::unique_ptr<AudioStream> CommonHostInterface::CreateAudioStream(AudioBackend
   }
 }
 
+s32 CommonHostInterface::GetAudioOutputVolume() const
+{
+  return g_settings.GetAudioOutputVolume(IsRunningAtNonStandardSpeed());
+}
+
 void CommonHostInterface::UpdateControllerInterface()
 {
   const std::string backend_str = GetStringSettingValue(
@@ -456,7 +489,7 @@ void CommonHostInterface::UpdateControllerInterface()
     ControllerInterface::ParseBackendName(backend_str.c_str());
   const ControllerInterface::Backend current_backend =
     (m_controller_interface ? m_controller_interface->GetBackend() : ControllerInterface::Backend::None);
-  if (new_backend == current_backend)
+  if (new_backend == current_backend || m_command_line_flags.disable_controller_interface)
     return;
 
   if (m_controller_interface)
@@ -572,33 +605,87 @@ bool CommonHostInterface::ResumeSystemFromMostRecentState()
   return LoadState(path.c_str());
 }
 
+bool CommonHostInterface::IsRunningAtNonStandardSpeed() const
+{
+  if (!System::IsValid())
+    return false;
+
+  const float target_speed = System::GetTargetSpeed();
+  return (target_speed <= 0.95f || target_speed >= 1.05f);
+}
+
 void CommonHostInterface::UpdateSpeedLimiterState()
 {
-  m_speed_limiter_enabled = g_settings.speed_limiter_enabled && !m_speed_limiter_temp_disabled;
+  float target_speed = m_turbo_enabled ?
+                         g_settings.turbo_speed :
+                         (m_fast_forward_enabled ? g_settings.fast_forward_speed : g_settings.emulation_speed);
+  m_throttler_enabled = (target_speed != 0.0f);
+  m_display_all_frames = !m_throttler_enabled || g_settings.display_all_frames;
 
-  const bool is_non_standard_speed = (std::abs(g_settings.emulation_speed - 1.0f) > 0.05f);
+  bool syncing_to_host = false;
+  if (g_settings.sync_to_host_refresh_rate && g_settings.audio_resampling && target_speed == 1.0f && m_display &&
+      System::IsRunning())
+  {
+    float host_refresh_rate;
+    if (m_display->GetHostRefreshRate(&host_refresh_rate))
+    {
+      const float ratio = host_refresh_rate / System::GetThrottleFrequency();
+      syncing_to_host = (ratio >= 0.95f && ratio <= 1.05f);
+      Log_InfoPrintf("Refresh rate: Host=%fhz Guest=%fhz Ratio=%f - %s", host_refresh_rate,
+                     System::GetThrottleFrequency(), ratio, syncing_to_host ? "can sync" : "can't sync");
+      if (syncing_to_host)
+        target_speed *= ratio;
+    }
+  }
+
+  const bool is_non_standard_speed = (std::abs(target_speed - 1.0f) > 0.05f);
   const bool audio_sync_enabled =
-    !System::IsRunning() || (m_speed_limiter_enabled && g_settings.audio_sync_enabled && !is_non_standard_speed);
+    !System::IsRunning() || (m_throttler_enabled && g_settings.audio_sync_enabled && !is_non_standard_speed);
   const bool video_sync_enabled =
-    !System::IsRunning() || (m_speed_limiter_enabled && g_settings.video_sync_enabled && !is_non_standard_speed);
+    !System::IsRunning() || (m_throttler_enabled && g_settings.video_sync_enabled && !is_non_standard_speed);
+  const float max_display_fps = (!System::IsValid() || m_throttler_enabled) ? 0.0f : g_settings.display_max_fps;
+  Log_InfoPrintf("Target speed: %f%%", target_speed * 100.0f);
   Log_InfoPrintf("Syncing to %s%s", audio_sync_enabled ? "audio" : "",
                  (audio_sync_enabled && video_sync_enabled) ? " and video" : (video_sync_enabled ? "video" : ""));
+  Log_InfoPrintf("Max display fps: %f (%s)", max_display_fps,
+                 m_display_all_frames ? "displaying all frames" : "skipping displaying frames when needed");
+
+  if (System::IsValid())
+  {
+    System::SetTargetSpeed(target_speed);
+    System::ResetPerformanceCounters();
+  }
 
   if (m_audio_stream)
   {
+    const u32 input_sample_rate = (target_speed == 0.0f || !g_settings.audio_resampling) ?
+                                    AUDIO_SAMPLE_RATE :
+                                    static_cast<u32>(static_cast<float>(AUDIO_SAMPLE_RATE) * target_speed);
+    Log_InfoPrintf("Audio input sample rate: %u hz", input_sample_rate);
+
+    m_audio_stream->SetInputSampleRate(input_sample_rate);
+    m_audio_stream->SetWaitForBufferFill(!m_display_all_frames);
+    m_audio_stream->SetOutputVolume(GetAudioOutputVolume());
     m_audio_stream->SetSync(audio_sync_enabled);
     if (audio_sync_enabled)
       m_audio_stream->EmptyBuffers();
   }
 
   if (m_display)
+  {
+    m_display->SetDisplayMaxFPS(max_display_fps);
     m_display->SetVSync(video_sync_enabled);
+  }
 
   if (g_settings.increase_timer_resolution)
-    SetTimerResolutionIncreased(m_speed_limiter_enabled);
+    SetTimerResolutionIncreased(m_throttler_enabled);
 
-  if (System::IsValid())
-    System::ResetPerformanceCounters();
+  // When syncing to host and using vsync, we don't need to sleep.
+  if (syncing_to_host && video_sync_enabled && m_display_all_frames)
+  {
+    Log_InfoPrintf("Using host vsync for throttling.");
+    m_throttler_enabled = false;
+  }
 }
 
 void CommonHostInterface::RecreateSystem()
@@ -634,12 +721,12 @@ void CommonHostInterface::SetUserDirectory()
 
   std::fprintf(stdout, "Program directory \"%s\"\n", m_program_directory.c_str());
 
-  if (FileSystem::FileExists(StringUtil::StdStringFromFormat("%s%c%s", m_program_directory.c_str(),
-                                                             FS_OSPATH_SEPERATOR_CHARACTER, "portable.txt")
-                               .c_str()) ||
-      FileSystem::FileExists(StringUtil::StdStringFromFormat("%s%c%s", m_program_directory.c_str(),
-                                                             FS_OSPATH_SEPERATOR_CHARACTER, "settings.ini")
-                               .c_str()))
+  if (FileSystem::FileExists(
+        StringUtil::StdStringFromFormat("%s" FS_OSPATH_SEPARATOR_STR "%s", m_program_directory.c_str(), "portable.txt")
+          .c_str()) ||
+      FileSystem::FileExists(
+        StringUtil::StdStringFromFormat("%s" FS_OSPATH_SEPARATOR_STR "%s", m_program_directory.c_str(), "settings.ini")
+          .c_str()))
   {
     std::fprintf(stdout, "portable.txt or old settings.ini found, using program directory as user directory.\n");
     m_user_directory = m_program_directory;
@@ -654,8 +741,8 @@ void CommonHostInterface::SetUserDirectory()
       const std::string documents_directory_str(StringUtil::WideStringToUTF8String(documents_directory));
       if (!documents_directory_str.empty())
       {
-        m_user_directory = StringUtil::StdStringFromFormat("%s%c%s", documents_directory_str.c_str(),
-                                                           FS_OSPATH_SEPERATOR_CHARACTER, "DuckStation");
+        m_user_directory = StringUtil::StdStringFromFormat("%s" FS_OSPATH_SEPARATOR_STR "%s",
+                                                           documents_directory_str.c_str(), "DuckStation");
       }
       CoTaskMemFree(documents_directory);
     }
@@ -690,6 +777,9 @@ void CommonHostInterface::SetUserDirectory()
 void CommonHostInterface::OnSystemCreated()
 {
   HostInterface::OnSystemCreated();
+
+  if (g_settings.display_post_processing && !m_display->SetPostProcessingChain(g_settings.display_post_process_chain))
+    AddOSDMessage(TranslateStdString("OSDMessage", "Failed to load post processing shader chain."), 20.0f);
 }
 
 void CommonHostInterface::OnSystemPaused(bool paused)
@@ -698,17 +788,21 @@ void CommonHostInterface::OnSystemPaused(bool paused)
 
   if (paused)
   {
-    if (IsFullscreen())
+    if (IsFullscreen() && !m_fullscreen_ui_enabled)
       SetFullscreen(false);
 
     StopControllerRumble();
   }
 
-  m_audio_stream->PauseOutput(paused);
+  UpdateSpeedLimiterState();
 }
 
 void CommonHostInterface::OnSystemDestroyed()
 {
+  // Restore present-all-frames behavior.
+  if (m_display)
+    m_display->SetDisplayMaxFPS(0.0f);
+
   HostInterface::OnSystemDestroyed();
 
   StopControllerRumble();
@@ -717,6 +811,13 @@ void CommonHostInterface::OnSystemDestroyed()
 void CommonHostInterface::OnRunningGameChanged()
 {
   HostInterface::OnRunningGameChanged();
+
+  if (!System::IsShutdown())
+  {
+    System::SetCheatList(nullptr);
+    if (g_settings.auto_load_cheats)
+      LoadCheatListFromGameTitle();
+  }
 
 #ifdef WITH_DISCORD_PRESENCE
   UpdateDiscordPresence();
@@ -732,6 +833,12 @@ void CommonHostInterface::OnControllerTypeChanged(u32 slot)
 
 void CommonHostInterface::DrawImGuiWindows()
 {
+  if (m_fullscreen_ui_enabled)
+  {
+    FullscreenUI::Render();
+    return;
+  }
+
   if (System::IsValid())
   {
     DrawDebugWindows();
@@ -830,6 +937,46 @@ void CommonHostInterface::AddOSDMessage(std::string message, float duration /*= 
   m_osd_messages.push_back(std::move(msg));
 }
 
+void CommonHostInterface::ClearOSDMessages()
+{
+  std::unique_lock<std::mutex> lock(m_osd_messages_lock);
+  m_osd_messages.clear();
+}
+
+bool CommonHostInterface::EnumerateOSDMessages(std::function<bool(const std::string&, float)> callback)
+{
+  std::unique_lock<std::mutex> lock(m_osd_messages_lock);
+  if (m_osd_messages.empty())
+    return true;
+
+  bool result = true;
+  auto iter = m_osd_messages.begin();
+  while (iter != m_osd_messages.end())
+  {
+    const OSDMessage& msg = *iter;
+    const double time = msg.time.GetTimeSeconds();
+    const float time_remaining = static_cast<float>(msg.duration - time);
+    if (time_remaining <= 0.0f)
+    {
+      iter = m_osd_messages.erase(iter);
+      continue;
+    }
+
+    if (!g_settings.display_show_osd_messages)
+    {
+      ++iter;
+      continue;
+    }
+
+    if (!callback(iter->text, time_remaining))
+      return false;
+
+    ++iter;
+  }
+
+  return true;
+}
+
 void CommonHostInterface::DrawOSDMessages()
 {
   constexpr ImGuiWindowFlags window_flags = ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoInputs |
@@ -842,6 +989,7 @@ void CommonHostInterface::DrawOSDMessages()
     return;
 
   const float scale = ImGui::GetIO().DisplayFramebufferScale.x;
+  const float max_width = ImGui::GetIO().DisplaySize.x - (20.0f * scale);
 
   auto iter = m_osd_messages.begin();
   float position_x = 10.0f * scale;
@@ -865,8 +1013,11 @@ void CommonHostInterface::DrawOSDMessages()
     }
 
     const float opacity = std::min(time_remaining, 1.0f);
+    const ImVec2 text_size(ImGui::CalcTextSize(msg.text.c_str(), nullptr));
+    const bool wrapped = (text_size.x > max_width);
+
     ImGui::SetNextWindowPos(ImVec2(position_x, position_y));
-    ImGui::SetNextWindowSize(ImVec2(0.0f, 0.0f));
+    ImGui::SetNextWindowSize(ImVec2(wrapped ? max_width : 0.0f, 0.0f));
     ImGui::PushStyleVar(ImGuiStyleVar_Alpha, opacity);
 
     char buf[64];
@@ -874,7 +1025,11 @@ void CommonHostInterface::DrawOSDMessages()
 
     if (ImGui::Begin(buf, nullptr, window_flags))
     {
-      ImGui::TextUnformatted(msg.text.c_str());
+      if (wrapped)
+        ImGui::TextWrapped("%s", msg.text.c_str());
+      else
+        ImGui::TextUnformatted(msg.text.c_str());
+
       position_y += ImGui::GetWindowSize().y + (4.0f * scale);
     }
 
@@ -896,6 +1051,8 @@ void CommonHostInterface::DrawDebugWindows()
     g_spu.DrawDebugStateWindow();
   if (g_settings.debugging.show_mdec_state)
     g_mdec.DrawDebugStateWindow();
+  if (g_settings.debugging.show_dma_state)
+    g_dma.DrawDebugStateWindow();
 }
 
 void CommonHostInterface::DoFrameStep()
@@ -905,6 +1062,25 @@ void CommonHostInterface::DoFrameStep()
 
   m_frame_step_request = true;
   PauseSystem(false);
+}
+
+void CommonHostInterface::DoToggleCheats()
+{
+  if (System::IsShutdown())
+    return;
+
+  CheatList* cl = System::GetCheatList();
+  if (!cl)
+  {
+    AddOSDMessage(TranslateStdString("OSDMessage", "No cheats are loaded."), 10.0f);
+    return;
+  }
+
+  cl->SetMasterEnable(!cl->GetMasterEnable());
+  AddFormattedOSDMessage(10.0f,
+                         cl->GetMasterEnable() ? TranslateString("OSDMessage", "%u cheats are now active.") :
+                                                 TranslateString("OSDMessage", "%u cheats are now inactive."),
+                         cl->GetEnabledCodeCount());
 }
 
 std::optional<CommonHostInterface::HostKeyCode>
@@ -941,7 +1117,10 @@ bool CommonHostInterface::HandleHostMouseEvent(HostMouseButton button, bool pres
 void CommonHostInterface::UpdateInputMap(SettingsInterface& si)
 {
   ClearInputMap();
-  UpdateControllerInputMap(si);
+
+  if (!UpdateControllerInputMapFromGameSettings())
+    UpdateControllerInputMap(si);
+
   UpdateHotkeyInputMap(si);
 }
 
@@ -961,11 +1140,22 @@ void CommonHostInterface::AddControllerRumble(u32 controller_index, u32 num_moto
   rumble.num_motors = std::min<u32>(num_motors, ControllerRumbleState::MAX_MOTORS);
   rumble.last_strength.fill(0.0f);
   rumble.update_callback = std::move(callback);
+  rumble.last_update_time = Common::Timer::GetValue();
   m_controller_vibration_motors.push_back(std::move(rumble));
 }
 
 void CommonHostInterface::UpdateControllerRumble()
 {
+  if (m_controller_vibration_motors.empty())
+    return;
+
+  // Rumble update frequency in milliseconds.
+  // We won't send an update to the controller unless this amount of time has passed, if the value has not changed.
+  // This is because the rumble update is synchronous, and with bluetooth latency can severely impact fast forward
+  // performance.
+  static constexpr float UPDATE_FREQUENCY = 1000.0f;
+  const u64 time = Common::Timer::GetValue();
+
   for (ControllerRumbleState& rumble : m_controller_vibration_motors)
   {
     Controller* controller = System::GetController(rumble.controller_index);
@@ -976,12 +1166,18 @@ void CommonHostInterface::UpdateControllerRumble()
     for (u32 i = 0; i < rumble.num_motors; i++)
     {
       const float strength = controller->GetVibrationMotorStrength(i);
-      changed |= (strength != rumble.last_strength[i]);
-      rumble.last_strength[i] = strength;
+      if (rumble.last_strength[i] != strength)
+      {
+        rumble.last_strength[i] = strength;
+        changed = true;
+      }
     }
 
-    if (changed)
+    if (changed || Common::Timer::ConvertValueToMilliseconds(time - rumble.last_update_time) >= UPDATE_FREQUENCY)
+    {
+      rumble.last_update_time = time;
       rumble.update_callback(rumble.last_strength.data(), rumble.num_motors);
+    }
   }
 }
 
@@ -989,15 +1185,10 @@ void CommonHostInterface::StopControllerRumble()
 {
   for (ControllerRumbleState& rumble : m_controller_vibration_motors)
   {
-    bool changed = false;
     for (u32 i = 0; i < rumble.num_motors; i++)
-    {
-      changed |= (rumble.last_strength[i] != 0.0f);
       rumble.last_strength[i] = 0.0f;
-    }
 
-    if (changed)
-      rumble.update_callback(rumble.last_strength.data(), rumble.num_motors);
+    rumble.update_callback(rumble.last_strength.data(), rumble.num_motors);
   }
 }
 
@@ -1041,7 +1232,7 @@ void CommonHostInterface::UpdateControllerInputMap(SettingsInterface& si)
         if (!SplitBinding(binding, &device, &button))
           continue;
 
-        AddButtonToInputMap(binding, device, button, [this, controller_index, button_code](bool pressed) {
+        AddButtonToInputMap(binding, device, button, [controller_index, button_code](bool pressed) {
           if (System::IsShutdown())
             return;
 
@@ -1055,8 +1246,9 @@ void CommonHostInterface::UpdateControllerInputMap(SettingsInterface& si)
     const auto axis_names = Controller::GetAxisNames(ctype);
     for (const auto& it : axis_names)
     {
-      const std::string& axis_name = it.first;
-      const s32 axis_code = it.second;
+      const std::string& axis_name = std::get<std::string>(it);
+      const s32 axis_code = std::get<s32>(it);
+      const auto axis_type = std::get<Controller::AxisType>(it);
 
       const std::vector<std::string> bindings =
         si.GetStringList(category, TinyString::FromFormat("Axis%s", axis_name.c_str()));
@@ -1066,7 +1258,7 @@ void CommonHostInterface::UpdateControllerInputMap(SettingsInterface& si)
         if (!SplitBinding(binding, &device, &axis))
           continue;
 
-        AddAxisToInputMap(binding, device, axis, [this, controller_index, axis_code](float value) {
+        AddAxisToInputMap(binding, device, axis, axis_type, [controller_index, axis_code](float value) {
           if (System::IsShutdown())
             return;
 
@@ -1087,10 +1279,6 @@ void CommonHostInterface::UpdateControllerInputMap(SettingsInterface& si)
 
     if (m_controller_interface)
     {
-      const float axis_scale = si.GetFloatValue(category, "AxisScale", 1.00f);
-      m_controller_interface->SetControllerAxisScale(controller_index,
-                                                     (ctype == ControllerType::AnalogController) ? axis_scale : 1.00f);
-
       const float deadzone_size = si.GetFloatValue(category, "Deadzone", 0.25f);
       m_controller_interface->SetControllerDeadzone(controller_index, deadzone_size);
     }
@@ -1188,6 +1376,30 @@ bool CommonHostInterface::AddButtonToInputMap(const std::string& binding, const 
 
       return true;
     }
+    else if (StringUtil::StartsWith(button, "Hat"))
+    {
+      const std::optional<int> hat_index = StringUtil::FromChars<int>(button.substr(3));
+      const std::optional<std::string_view> hat_direction = [](const auto& button) {
+        std::optional<std::string_view> result;
+
+        const size_t pos = button.find(' ');
+        if (pos != button.npos)
+        {
+          result = button.substr(pos + 1);
+        }
+        return result;
+      }(button);
+
+      if (!hat_index || !hat_direction ||
+          !m_controller_interface->BindControllerHatToButton(*controller_index, *hat_index, *hat_direction,
+                                                             std::move(handler)))
+      {
+        Log_WarningPrintf("Failed to bind controller hat '%s' to button", binding.c_str());
+        return false;
+      }
+
+      return true;
+    }
 
     Log_WarningPrintf("Malformed controller binding '%s' in button", binding.c_str());
     return false;
@@ -1198,8 +1410,46 @@ bool CommonHostInterface::AddButtonToInputMap(const std::string& binding, const 
 }
 
 bool CommonHostInterface::AddAxisToInputMap(const std::string& binding, const std::string_view& device,
-                                            const std::string_view& axis, InputAxisHandler handler)
+                                            const std::string_view& axis, Controller::AxisType axis_type,
+                                            InputAxisHandler handler)
 {
+  if (axis_type == Controller::AxisType::Half)
+  {
+    if (device == "Keyboard")
+    {
+      std::optional<int> key_id = GetHostKeyCode(axis);
+      if (!key_id.has_value())
+      {
+        Log_WarningPrintf("Unknown keyboard key in binding '%s'", binding.c_str());
+        return false;
+      }
+
+      m_keyboard_input_handlers.emplace(key_id.value(),
+                                        [cb = std::move(handler)](bool pressed) { cb(pressed ? 1.0f : -1.0f); });
+      return true;
+    }
+
+    if (device == "Mouse")
+    {
+      if (StringUtil::StartsWith(axis, "Button"))
+      {
+        const std::optional<s32> button_index = StringUtil::FromChars<s32>(axis.substr(6));
+        if (!button_index.has_value())
+        {
+          Log_WarningPrintf("Invalid button in mouse binding '%s'", binding.c_str());
+          return false;
+        }
+
+        m_mouse_input_handlers.emplace(static_cast<HostMouseButton>(button_index.value()),
+                                       [cb = std::move(handler)](bool pressed) { cb(pressed ? 1.0f : -1.0f); });
+        return true;
+      }
+
+      Log_WarningPrintf("Malformed mouse binding '%s'", binding.c_str());
+      return false;
+    }
+  }
+
   if (StringUtil::StartsWith(device, "Controller"))
   {
     if (!m_controller_interface)
@@ -1215,13 +1465,46 @@ bool CommonHostInterface::AddAxisToInputMap(const std::string& binding, const st
       return false;
     }
 
-    if (StringUtil::StartsWith(axis, "Axis"))
+    if (StringUtil::StartsWith(axis, "Axis") || StringUtil::StartsWith(axis, "+Axis") ||
+        StringUtil::StartsWith(axis, "-Axis"))
     {
-      const std::optional<int> axis_index = StringUtil::FromChars<int>(axis.substr(4));
-      if (!axis_index ||
-          !m_controller_interface->BindControllerAxis(*controller_index, *axis_index, std::move(handler)))
+      const std::optional<int> axis_index =
+        StringUtil::FromChars<int>(axis.substr(axis[0] == '+' || axis[0] == '-' ? 5 : 4));
+      if (axis_index)
       {
-        Log_WarningPrintf("Failed to bind controller axis '%s' to axis", binding.c_str());
+        ControllerInterface::AxisSide axis_side = ControllerInterface::AxisSide::Full;
+        if (axis[0] == '+')
+          axis_side = ControllerInterface::AxisSide::Positive;
+        else if (axis[0] == '-')
+          axis_side = ControllerInterface::AxisSide::Negative;
+
+        const bool inverted = StringUtil::EndsWith(axis, "-");
+        if (!inverted)
+        {
+          if (m_controller_interface->BindControllerAxis(*controller_index, *axis_index, axis_side, std::move(handler)))
+          {
+            return true;
+          }
+        }
+        else
+        {
+          if (m_controller_interface->BindControllerAxis(*controller_index, *axis_index, axis_side,
+                                                         [cb = std::move(handler)](float value) { cb(-value); }))
+          {
+            return true;
+          }
+        }
+      }
+      Log_WarningPrintf("Failed to bind controller axis '%s' to axis", binding.c_str());
+      return false;
+    }
+    else if (StringUtil::StartsWith(axis, "Button") && axis_type == Controller::AxisType::Half)
+    {
+      const std::optional<int> button_index = StringUtil::FromChars<int>(axis.substr(6));
+      if (!button_index ||
+          !m_controller_interface->BindControllerButtonToAxis(*controller_index, *button_index, std::move(handler)))
+      {
+        Log_WarningPrintf("Failed to bind controller button '%s' to axis", binding.c_str());
         return false;
       }
 
@@ -1264,44 +1547,87 @@ bool CommonHostInterface::AddRumbleToInputMap(const std::string& binding, u32 co
   return false;
 }
 
+void CommonHostInterface::SetFastForwardEnabled(bool enabled)
+{
+  if (!System::IsValid())
+    return;
+
+  m_fast_forward_enabled = enabled;
+  UpdateSpeedLimiterState();
+  AddOSDMessage(enabled ? TranslateStdString("OSDMessage", "Fast forwarding...") :
+                          TranslateStdString("OSDMessage", "Stopped fast forwarding."),
+                2.0f);
+}
+
+void CommonHostInterface::SetTurboEnabled(bool enabled)
+{
+  if (!System::IsValid())
+    return;
+
+  m_turbo_enabled = enabled;
+  UpdateSpeedLimiterState();
+  AddOSDMessage(enabled ? TranslateStdString("OSDMessage", "Turboing...") :
+                          TranslateStdString("OSDMessage", "Stopped turboing."),
+                2.0f);
+}
+
+void CommonHostInterface::RegisterHotkeys()
+{
+  RegisterGeneralHotkeys();
+  RegisterGraphicsHotkeys();
+  RegisterSaveStateHotkeys();
+  RegisterAudioHotkeys();
+}
+
 void CommonHostInterface::RegisterGeneralHotkeys()
 {
-  RegisterHotkey(StaticString("General"), StaticString("FastForward"), TRANSLATABLE("Hotkeys", "Fast Forward"),
-                 [this](bool pressed) {
-                   m_speed_limiter_temp_disabled = pressed;
-                   UpdateSpeedLimiterState();
+  RegisterHotkey(StaticString(TRANSLATABLE("Hotkeys", "General")), StaticString("OpenQuickMenu"),
+                 TRANSLATABLE("Hotkeys", "Open Quick Menu"), [this](bool pressed) {
+                   if (pressed && m_fullscreen_ui_enabled)
+                     FullscreenUI::OpenQuickMenu();
                  });
 
-  RegisterHotkey(StaticString("General"), StaticString("ToggleFastForward"),
+  RegisterHotkey(StaticString(TRANSLATABLE("Hotkeys", "General")), StaticString("FastForward"),
+                 TRANSLATABLE("Hotkeys", "Fast Forward"), [this](bool pressed) { SetFastForwardEnabled(pressed); });
+
+  RegisterHotkey(StaticString(TRANSLATABLE("Hotkeys", "General")), StaticString("ToggleFastForward"),
                  StaticString(TRANSLATABLE("Hotkeys", "Toggle Fast Forward")), [this](bool pressed) {
-                   if (!pressed)
-                   {
-                     m_speed_limiter_temp_disabled = !m_speed_limiter_temp_disabled;
-                     UpdateSpeedLimiterState();
-                     AddOSDMessage(m_speed_limiter_enabled ?
-                                     TranslateStdString("OSDMessage", "Speed limiter enabled.") :
-                                     TranslateStdString("OSDMessage", "Speed limiter disabled."),
-                                   2.0f);
-                   }
+                   if (pressed)
+                     SetFastForwardEnabled(!m_fast_forward_enabled);
                  });
 
-  RegisterHotkey(StaticString("General"), StaticString("ToggleFullscreen"),
+  RegisterHotkey(StaticString(TRANSLATABLE("Hotkeys", "General")), StaticString("Turbo"),
+                 TRANSLATABLE("Hotkeys", "Turbo"), [this](bool pressed) { SetTurboEnabled(pressed); });
+
+  RegisterHotkey(StaticString(TRANSLATABLE("Hotkeys", "General")), StaticString("ToggleTurbo"),
+                 StaticString(TRANSLATABLE("Hotkeys", "Toggle Turbo")), [this](bool pressed) {
+                   if (pressed)
+                     SetTurboEnabled(!m_turbo_enabled);
+                 });
+#ifndef ANDROID
+  RegisterHotkey(StaticString(TRANSLATABLE("Hotkeys", "General")), StaticString("ToggleFullscreen"),
                  StaticString(TRANSLATABLE("Hotkeys", "Toggle Fullscreen")), [this](bool pressed) {
-                   if (!pressed)
+                   if (pressed)
                      SetFullscreen(!IsFullscreen());
                  });
 
-  RegisterHotkey(StaticString("General"), StaticString("TogglePause"),
+  RegisterHotkey(StaticString(TRANSLATABLE("Hotkeys", "General")), StaticString("TogglePause"),
                  StaticString(TRANSLATABLE("Hotkeys", "Toggle Pause")), [this](bool pressed) {
-                   if (System::IsValid() && !pressed)
+                   if (pressed && System::IsValid())
                      PauseSystem(!System::IsPaused());
                  });
 
-  RegisterHotkey(StaticString("General"), StaticString("PowerOff"),
+  RegisterHotkey(StaticString(TRANSLATABLE("Hotkeys", "General")), StaticString("ToggleCheats"),
+                 StaticString(TRANSLATABLE("Hotkeys", "Toggle Cheats")), [this](bool pressed) {
+                   if (pressed && System::IsValid())
+                     DoToggleCheats();
+                 });
+
+  RegisterHotkey(StaticString(TRANSLATABLE("Hotkeys", "General")), StaticString("PowerOff"),
                  StaticString(TRANSLATABLE("Hotkeys", "Power Off System")), [this](bool pressed) {
-                   if (!pressed && System::IsValid())
+                   if (pressed && System::IsValid())
                    {
-                     if (g_settings.confim_power_off && !m_batch_mode)
+                     if (g_settings.confim_power_off && !InBatchMode())
                      {
                        SmallString confirmation_message(
                          TranslateString("CommonHostInterface", "Are you sure you want to stop emulation?"));
@@ -1319,44 +1645,76 @@ void CommonHostInterface::RegisterGeneralHotkeys()
                        }
                      }
 
+                     if (g_settings.save_state_on_exit)
+                       SaveResumeSaveState();
+
                      PowerOffSystem();
                    }
                  });
+#else
+  RegisterHotkey(StaticString(TRANSLATABLE("Hotkeys", "General")), StaticString("TogglePatchCodes"),
+                 StaticString(TRANSLATABLE("Hotkeys", "Toggle Patch Codes")), [this](bool pressed) {
+                   if (pressed && System::IsValid())
+                     DoToggleCheats();
+                 });
+#endif
 
-  RegisterHotkey(StaticString("General"), StaticString("Screenshot"),
+  RegisterHotkey(StaticString(TRANSLATABLE("Hotkeys", "General")), StaticString("Reset"),
+                 StaticString(TRANSLATABLE("Hotkeys", "Reset System")), [this](bool pressed) {
+                   if (pressed && System::IsValid())
+                     ResetSystem();
+                 });
+
+  RegisterHotkey(StaticString(TRANSLATABLE("Hotkeys", "General")), StaticString("Screenshot"),
                  StaticString(TRANSLATABLE("Hotkeys", "Save Screenshot")), [this](bool pressed) {
-                   if (!pressed && System::IsValid())
+                   if (pressed && System::IsValid())
                      SaveScreenshot();
                  });
 
-  RegisterHotkey(StaticString("General"), StaticString("FrameStep"),
+  RegisterHotkey(StaticString(TRANSLATABLE("Hotkeys", "General")), StaticString("FrameStep"),
                  StaticString(TRANSLATABLE("Hotkeys", "Frame Step")), [this](bool pressed) {
-                   if (!pressed)
-                   {
+                   if (pressed && System::IsValid())
                      DoFrameStep();
+                 });
+
+  RegisterHotkey(StaticString(TRANSLATABLE("Hotkeys", "General")), StaticString("Rewind"),
+                 StaticString(TRANSLATABLE("Hotkeys", "Rewind")), [this](bool pressed) {
+                   if (System::IsValid())
+                   {
+                     AddOSDMessage(pressed ? TranslateStdString("OSDMessage", "Rewinding...") :
+                                             TranslateStdString("OSDMessage", "Stopped rewinding."),
+                                   5.0f);
+                     System::SetRewinding(pressed);
                    }
                  });
 }
 
 void CommonHostInterface::RegisterGraphicsHotkeys()
 {
-  RegisterHotkey(StaticString("Graphics"), StaticString("ToggleSoftwareRendering"),
+  RegisterHotkey(StaticString(TRANSLATABLE("Hotkeys", "Graphics")), StaticString("ToggleSoftwareRendering"),
                  StaticString(TRANSLATABLE("Hotkeys", "Toggle Software Rendering")), [this](bool pressed) {
-                   if (!pressed)
+                   if (pressed && System::IsValid())
                      ToggleSoftwareRendering();
                  });
 
-  RegisterHotkey(StaticString("Graphics"), StaticString("TogglePGXP"),
+  RegisterHotkey(StaticString(TRANSLATABLE("Hotkeys", "Graphics")), StaticString("TogglePGXP"),
                  StaticString(TRANSLATABLE("Hotkeys", "Toggle PGXP")), [this](bool pressed) {
-                   if (!pressed)
+                   if (pressed && System::IsValid())
                    {
                      g_settings.gpu_pgxp_enable = !g_settings.gpu_pgxp_enable;
+                     g_gpu->RestoreGraphicsAPIState();
                      g_gpu->UpdateSettings();
-                     AddFormattedOSDMessage(5.0f, "PGXP is now %s.",
-                                            g_settings.gpu_pgxp_enable ? "enabled" : "disabled");
+                     g_gpu->ResetGraphicsAPIState();
+                     System::ClearMemorySaveStates();
+                     AddOSDMessage(g_settings.gpu_pgxp_enable ?
+                                     TranslateStdString("OSDMessage", "PGXP is now enabled.") :
+                                     TranslateStdString("OSDMessage", "PGXP is now disabled"),
+                                   5.0f);
 
                      if (g_settings.gpu_pgxp_enable)
                        PGXP::Initialize();
+                     else
+                       PGXP::Shutdown();
 
                      // we need to recompile all blocks if pgxp is toggled on/off
                      if (g_settings.IsUsingCodeCache())
@@ -1364,110 +1722,207 @@ void CommonHostInterface::RegisterGraphicsHotkeys()
                    }
                  });
 
-  RegisterHotkey(StaticString("Graphics"), StaticString("IncreaseResolutionScale"),
+  RegisterHotkey(StaticString(TRANSLATABLE("Hotkeys", "Graphics")), StaticString("TogglePGXPDepth"),
+                 StaticString(TRANSLATABLE("Hotkeys", "Toggle PGXP Depth Buffer")), [this](bool pressed) {
+                   if (pressed && System::IsValid())
+                   {
+                     g_settings.gpu_pgxp_depth_buffer = !g_settings.gpu_pgxp_depth_buffer;
+                     if (!g_settings.gpu_pgxp_enable)
+                       return;
+
+                     g_gpu->RestoreGraphicsAPIState();
+                     g_gpu->UpdateSettings();
+                     g_gpu->ResetGraphicsAPIState();
+                     System::ClearMemorySaveStates();
+                     AddOSDMessage(g_settings.gpu_pgxp_depth_buffer ?
+                                     TranslateStdString("OSDMessage", "PGXP Depth Buffer is now enabled.") :
+                                     TranslateStdString("OSDMessage", "PGXP Depth Buffer is now disabled."),
+                                   5.0f);
+                   }
+                 });
+
+  RegisterHotkey(StaticString(TRANSLATABLE("Hotkeys", "Graphics")), StaticString("IncreaseResolutionScale"),
                  StaticString(TRANSLATABLE("Hotkeys", "Increase Resolution Scale")), [this](bool pressed) {
-                   if (!pressed)
+                   if (pressed && System::IsValid())
                      ModifyResolutionScale(1);
                  });
 
-  RegisterHotkey(StaticString("Graphics"), StaticString("DecreaseResolutionScale"),
+  RegisterHotkey(StaticString(TRANSLATABLE("Hotkeys", "Graphics")), StaticString("DecreaseResolutionScale"),
                  StaticString(TRANSLATABLE("Hotkeys", "Decrease Resolution Scale")), [this](bool pressed) {
-                   if (!pressed)
+                   if (pressed && System::IsValid())
                      ModifyResolutionScale(-1);
+                 });
+
+  RegisterHotkey(StaticString(TRANSLATABLE("Hotkeys", "Graphics")), StaticString("TogglePostProcessing"),
+                 StaticString(TRANSLATABLE("Hotkeys", "Toggle Post-Processing")), [this](bool pressed) {
+                   if (pressed && System::IsValid())
+                     TogglePostProcessing();
+                 });
+
+  RegisterHotkey(StaticString(TRANSLATABLE("Hotkeys", "Graphics")), StaticString("ReloadPostProcessingShaders"),
+                 StaticString(TRANSLATABLE("Hotkeys", "Reload Post Processing Shaders")), [this](bool pressed) {
+                   if (pressed && System::IsValid())
+                     ReloadPostProcessingShaders();
+                 });
+
+  RegisterHotkey(StaticString(TRANSLATABLE("Hotkeys", "Graphics")), StaticString("ReloadTextureReplacements"),
+                 StaticString(TRANSLATABLE("Hotkeys", "Reload Texture Replacements")), [this](bool pressed) {
+                   if (pressed && System::IsValid())
+                   {
+                     AddOSDMessage(TranslateStdString("OSDMessage", "Texture replacements reloaded."), 10.0f);
+                     g_texture_replacements.Reload();
+                   }
                  });
 }
 
 void CommonHostInterface::RegisterSaveStateHotkeys()
 {
-  RegisterHotkey(StaticString("Save States"), StaticString("LoadSelectedSaveState"),
+  RegisterHotkey(StaticString(TRANSLATABLE("Hotkeys", "Save States")), StaticString("LoadSelectedSaveState"),
                  StaticString(TRANSLATABLE("Hotkeys", "Load From Selected Slot")), [this](bool pressed) {
-                   if (!pressed)
+                   if (pressed)
                      m_save_state_selector_ui->LoadCurrentSlot();
                  });
-  RegisterHotkey(StaticString("Save States"), StaticString("SaveSelectedSaveState"),
+  RegisterHotkey(StaticString(TRANSLATABLE("Hotkeys", "Save States")), StaticString("SaveSelectedSaveState"),
                  StaticString(TRANSLATABLE("Hotkeys", "Save To Selected Slot")), [this](bool pressed) {
-                   if (!pressed)
+                   if (pressed)
                      m_save_state_selector_ui->SaveCurrentSlot();
                  });
-  RegisterHotkey(StaticString("Save States"), StaticString("SelectPreviousSaveStateSlot"),
+  RegisterHotkey(StaticString(TRANSLATABLE("Hotkeys", "Save States")), StaticString("SelectPreviousSaveStateSlot"),
                  StaticString(TRANSLATABLE("Hotkeys", "Select Previous Save Slot")), [this](bool pressed) {
-                   if (!pressed)
+                   if (pressed)
                      m_save_state_selector_ui->SelectPreviousSlot();
                  });
-  RegisterHotkey(StaticString("Save States"), StaticString("SelectNextSaveStateSlot"),
+  RegisterHotkey(StaticString(TRANSLATABLE("Hotkeys", "Save States")), StaticString("SelectNextSaveStateSlot"),
                  StaticString(TRANSLATABLE("Hotkeys", "Select Next Save Slot")), [this](bool pressed) {
-                   if (!pressed)
+                   if (pressed)
                      m_save_state_selector_ui->SelectNextSlot();
                  });
 
   for (u32 slot = 1; slot <= PER_GAME_SAVE_STATE_SLOTS; slot++)
   {
-    RegisterHotkey(StaticString("Save States"), TinyString::FromFormat("LoadGameState%u", slot),
-                   TinyString::FromFormat(TRANSLATABLE("Hotkeys", "Load Game State %u"), slot),
+    RegisterHotkey(StaticString(TRANSLATABLE("Hotkeys", "Save States")),
+                   TinyString::FromFormat("LoadGameState%u", slot), TinyString::FromFormat("Load Game State %u", slot),
                    [this, slot](bool pressed) {
-                     if (!pressed)
+                     if (pressed)
                        LoadState(false, slot);
                    });
-    RegisterHotkey(StaticString("Save States"), TinyString::FromFormat("SaveGameState%u", slot),
-                   TinyString::FromFormat(TRANSLATABLE("Hotkeys", "Save Game State %u"), slot),
+    RegisterHotkey(StaticString(TRANSLATABLE("Hotkeys", "Save States")),
+                   TinyString::FromFormat("SaveGameState%u", slot), TinyString::FromFormat("Save Game State %u", slot),
                    [this, slot](bool pressed) {
-                     if (!pressed)
+                     if (pressed)
                        SaveState(false, slot);
                    });
   }
 
   for (u32 slot = 1; slot <= GLOBAL_SAVE_STATE_SLOTS; slot++)
   {
-    RegisterHotkey(StaticString("Save States"), TinyString::FromFormat("LoadGlobalState%u", slot),
-                   TinyString::FromFormat(TRANSLATABLE("Hotkeys", "Load Global State %u"), slot),
-                   [this, slot](bool pressed) {
-                     if (!pressed)
+    RegisterHotkey(StaticString(TRANSLATABLE("Hotkeys", "Save States")),
+                   TinyString::FromFormat("LoadGlobalState%u", slot),
+                   TinyString::FromFormat("Load Global State %u", slot), [this, slot](bool pressed) {
+                     if (pressed)
                        LoadState(true, slot);
                    });
-    RegisterHotkey(StaticString("Save States"), TinyString::FromFormat("SaveGlobalState%u", slot),
-                   TinyString::FromFormat(TRANSLATABLE("Hotkeys", "Save Global State %u"), slot),
-                   [this, slot](bool pressed) {
-                     if (!pressed)
+    RegisterHotkey(StaticString(TRANSLATABLE("Hotkeys", "Save States")),
+                   TinyString::FromFormat("SaveGlobalState%u", slot),
+                   TinyString::FromFormat("Save Global State %u", slot), [this, slot](bool pressed) {
+                     if (pressed)
                        SaveState(true, slot);
                    });
   }
+
+  // Dummy strings for translation because we construct them in a loop.
+  (void)TRANSLATABLE("Hotkeys", "Load Game State 1");
+  (void)TRANSLATABLE("Hotkeys", "Load Game State 2");
+  (void)TRANSLATABLE("Hotkeys", "Load Game State 3");
+  (void)TRANSLATABLE("Hotkeys", "Load Game State 4");
+  (void)TRANSLATABLE("Hotkeys", "Load Game State 5");
+  (void)TRANSLATABLE("Hotkeys", "Load Game State 6");
+  (void)TRANSLATABLE("Hotkeys", "Load Game State 7");
+  (void)TRANSLATABLE("Hotkeys", "Load Game State 8");
+  (void)TRANSLATABLE("Hotkeys", "Load Game State 9");
+  (void)TRANSLATABLE("Hotkeys", "Load Game State 10");
+  (void)TRANSLATABLE("Hotkeys", "Save Game State 1");
+  (void)TRANSLATABLE("Hotkeys", "Save Game State 2");
+  (void)TRANSLATABLE("Hotkeys", "Save Game State 3");
+  (void)TRANSLATABLE("Hotkeys", "Save Game State 4");
+  (void)TRANSLATABLE("Hotkeys", "Save Game State 5");
+  (void)TRANSLATABLE("Hotkeys", "Save Game State 6");
+  (void)TRANSLATABLE("Hotkeys", "Save Game State 7");
+  (void)TRANSLATABLE("Hotkeys", "Save Game State 8");
+  (void)TRANSLATABLE("Hotkeys", "Save Game State 9");
+  (void)TRANSLATABLE("Hotkeys", "Save Game State 10");
+  (void)TRANSLATABLE("Hotkeys", "Load Global State 1");
+  (void)TRANSLATABLE("Hotkeys", "Load Global State 2");
+  (void)TRANSLATABLE("Hotkeys", "Load Global State 3");
+  (void)TRANSLATABLE("Hotkeys", "Load Global State 4");
+  (void)TRANSLATABLE("Hotkeys", "Load Global State 5");
+  (void)TRANSLATABLE("Hotkeys", "Load Global State 6");
+  (void)TRANSLATABLE("Hotkeys", "Load Global State 7");
+  (void)TRANSLATABLE("Hotkeys", "Load Global State 8");
+  (void)TRANSLATABLE("Hotkeys", "Load Global State 9");
+  (void)TRANSLATABLE("Hotkeys", "Load Global State 10");
+  (void)TRANSLATABLE("Hotkeys", "Save Global State 1");
+  (void)TRANSLATABLE("Hotkeys", "Save Global State 2");
+  (void)TRANSLATABLE("Hotkeys", "Save Global State 3");
+  (void)TRANSLATABLE("Hotkeys", "Save Global State 4");
+  (void)TRANSLATABLE("Hotkeys", "Save Global State 5");
+  (void)TRANSLATABLE("Hotkeys", "Save Global State 6");
+  (void)TRANSLATABLE("Hotkeys", "Save Global State 7");
+  (void)TRANSLATABLE("Hotkeys", "Save Global State 8");
+  (void)TRANSLATABLE("Hotkeys", "Save Global State 9");
+  (void)TRANSLATABLE("Hotkeys", "Save Global State 10");
 }
 
 void CommonHostInterface::RegisterAudioHotkeys()
 {
-  RegisterHotkey(
-    StaticString("Audio"), StaticString("AudioMute"), StaticString(TRANSLATABLE("Hotkeys", "Toggle Mute")),
-    [this](bool pressed) {
-      if (System::IsValid() && !pressed)
-      {
-        g_settings.audio_output_muted = !g_settings.audio_output_muted;
-        m_audio_stream->SetOutputVolume(g_settings.audio_output_muted ? 0 : g_settings.audio_output_volume);
-        if (g_settings.audio_output_muted)
-          AddOSDMessage(TranslateStdString("OSDMessage", "Volume: Muted"), 2.0f);
-        else
-          AddFormattedOSDMessage(2.0f, TranslateString("OSDMessage", "Volume: %d%%"), g_settings.audio_output_volume);
-      }
-    });
-  RegisterHotkey(StaticString("Audio"), StaticString("AudioVolumeUp"),
-                 StaticString(TRANSLATABLE("Hotkeys", "Volume Up")), [this](bool pressed) {
-                   if (System::IsValid() && pressed)
+  RegisterHotkey(StaticString(TRANSLATABLE("Hotkeys", "Audio")), StaticString("AudioMute"),
+                 StaticString(TRANSLATABLE("Hotkeys", "Toggle Mute")), [this](bool pressed) {
+                   if (pressed && System::IsValid())
                    {
-                     g_settings.audio_output_volume = std::min<s32>(g_settings.audio_output_volume + 10, 100);
-                     g_settings.audio_output_muted = false;
-                     m_audio_stream->SetOutputVolume(g_settings.audio_output_volume);
-                     AddFormattedOSDMessage(2.0f, TranslateString("OSDMessage", "Volume: %d%%"),
-                                            g_settings.audio_output_volume);
+                     g_settings.audio_output_muted = !g_settings.audio_output_muted;
+                     const s32 volume = GetAudioOutputVolume();
+                     m_audio_stream->SetOutputVolume(volume);
+                     if (g_settings.audio_output_muted)
+                       AddOSDMessage(TranslateStdString("OSDMessage", "Volume: Muted"), 2.0f);
+                     else
+                       AddFormattedOSDMessage(2.0f, TranslateString("OSDMessage", "Volume: %d%%"), volume);
                    }
                  });
-  RegisterHotkey(StaticString("Audio"), StaticString("AudioVolumeDown"),
-                 StaticString(TRANSLATABLE("Hotkeys", "Volume Down")), [this](bool pressed) {
-                   if (System::IsValid() && pressed)
+  RegisterHotkey(StaticString(TRANSLATABLE("Hotkeys", "Audio")), StaticString("AudioCDAudioMute"),
+                 StaticString(TRANSLATABLE("Hotkeys", "Toggle CD Audio Mute")), [this](bool pressed) {
+                   if (pressed && System::IsValid())
                    {
-                     g_settings.audio_output_volume = std::max<s32>(g_settings.audio_output_volume - 10, 0);
+                     g_settings.cdrom_mute_cd_audio = !g_settings.cdrom_mute_cd_audio;
+                     AddOSDMessage(g_settings.cdrom_mute_cd_audio ?
+                                     TranslateStdString("OSDMessage", "CD Audio Muted.") :
+                                     TranslateStdString("OSDMessage", "CD Audio Unmuted."),
+                                   2.0f);
+                   }
+                 });
+  RegisterHotkey(StaticString(TRANSLATABLE("Hotkeys", "Audio")), StaticString("AudioVolumeUp"),
+                 StaticString(TRANSLATABLE("Hotkeys", "Volume Up")), [this](bool pressed) {
+                   if (pressed && System::IsValid())
+                   {
                      g_settings.audio_output_muted = false;
-                     m_audio_stream->SetOutputVolume(g_settings.audio_output_volume);
-                     AddFormattedOSDMessage(2.0f, TranslateString("OSDMessage", "Volume: %d%%"),
-                                            g_settings.audio_output_volume);
+
+                     const s32 volume = std::min<s32>(GetAudioOutputVolume() + 10, 100);
+                     g_settings.audio_output_volume = volume;
+                     g_settings.audio_fast_forward_volume = volume;
+                     m_audio_stream->SetOutputVolume(volume);
+                     AddFormattedOSDMessage(2.0f, TranslateString("OSDMessage", "Volume: %d%%"), volume);
+                   }
+                 });
+  RegisterHotkey(StaticString(TRANSLATABLE("Hotkeys", "Audio")), StaticString("AudioVolumeDown"),
+                 StaticString(TRANSLATABLE("Hotkeys", "Volume Down")), [this](bool pressed) {
+                   if (pressed && System::IsValid())
+                   {
+                     g_settings.audio_output_muted = false;
+
+                     const s32 volume = std::max<s32>(GetAudioOutputVolume() - 10, 0);
+                     g_settings.audio_output_volume = volume;
+                     g_settings.audio_fast_forward_volume = volume;
+                     m_audio_stream->SetOutputVolume(volume);
+                     AddFormattedOSDMessage(2.0f, TranslateString("OSDMessage", "Volume: %d%%"), volume);
                    }
                  });
 }
@@ -1512,32 +1967,28 @@ void CommonHostInterface::FindInputProfiles(const std::string& base_path, InputP
     }
 
     std::string filename(
-      StringUtil::StdStringFromFormat("%s%c%s", base_path.c_str(), FS_OSPATH_SEPERATOR_CHARACTER, it.FileName.c_str()));
+      StringUtil::StdStringFromFormat("%s" FS_OSPATH_SEPARATOR_STR "%s", base_path.c_str(), it.FileName.c_str()));
     out_list->push_back(InputProfileEntry{std::move(name), std::move(filename)});
   }
+}
+
+std::string CommonHostInterface::GetInputProfilePath(const char* name) const
+{
+  std::string path = GetUserDirectoryRelativePath("inputprofiles" FS_OSPATH_SEPARATOR_STR "%s.ini", name);
+  if (FileSystem::FileExists(path.c_str()))
+    return path;
+
+  path = GetProgramDirectoryRelativePath("inputprofiles" FS_OSPATH_SEPARATOR_STR "%s.ini", name);
+  if (FileSystem::FileExists(path.c_str()))
+    return path;
+
+  return {};
 }
 
 void CommonHostInterface::ClearAllControllerBindings(SettingsInterface& si)
 {
   for (u32 controller_index = 1; controller_index <= NUM_CONTROLLER_AND_CARD_PORTS; controller_index++)
-  {
-    const ControllerType ctype = g_settings.controller_types[controller_index - 1];
-    if (ctype == ControllerType::None)
-      continue;
-
-    const auto section_name = TinyString::FromFormat("Controller%u", controller_index);
-
-    si.DeleteValue(section_name, "Type");
-
-    for (const auto& button : Controller::GetButtonNames(ctype))
-      si.DeleteValue(section_name, button.first.c_str());
-
-    for (const auto& axis : Controller::GetAxisNames(ctype))
-      si.DeleteValue(section_name, axis.first.c_str());
-
-    if (Controller::GetVibrationMotorCount(ctype) > 0)
-      si.DeleteValue(section_name, "Rumble");
-  }
+    si.ClearSection(TinyString::FromFormat("Controller%u", controller_index));
 }
 
 void CommonHostInterface::ApplyInputProfile(const char* profile_path, SettingsInterface& si)
@@ -1552,7 +2003,11 @@ void CommonHostInterface::ApplyInputProfile(const char* profile_path, SettingsIn
     const auto section_name = TinyString::FromFormat("Controller%u", controller_index);
     const std::string ctype_str = profile.GetStringValue(section_name, "Type");
     if (ctype_str.empty())
+    {
+      si.SetStringValue(section_name, "Type", Settings::GetControllerTypeName(ControllerType::None));
+      g_settings.controller_types[controller_index - 1] = ControllerType::None;
       continue;
+    }
 
     std::optional<ControllerType> ctype = Settings::ParseControllerTypeName(ctype_str.c_str());
     if (!ctype)
@@ -1577,17 +2032,20 @@ void CommonHostInterface::ApplyInputProfile(const char* profile_path, SettingsIn
 
     for (const auto& axis : Controller::GetAxisNames(*ctype))
     {
-      const auto key_name = TinyString::FromFormat("Axis%s", axis.first.c_str());
-      si.DeleteValue(section_name, axis.first.c_str());
+      const auto key_name = TinyString::FromFormat("Axis%s", std::get<std::string>(axis).c_str());
+      si.DeleteValue(section_name, std::get<std::string>(axis).c_str());
       const std::vector<std::string> bindings = profile.GetStringList(section_name, key_name);
       for (const std::string& binding : bindings)
         si.AddToStringList(section_name, key_name, binding.c_str());
     }
 
     si.DeleteValue(section_name, "Rumble");
-    const std::string rumble_value = profile.GetStringValue(section_name, "Rumble");
-    if (!rumble_value.empty())
-      si.SetStringValue(section_name, "Rumble", rumble_value.c_str());
+    if (Controller::GetVibrationMotorCount(*ctype) > 0)
+    {
+      const std::string rumble_value = profile.GetStringValue(section_name, "Rumble");
+      if (!rumble_value.empty())
+        si.SetStringValue(section_name, "Rumble", rumble_value.c_str());
+    }
 
     Controller::SettingList settings = Controller::GetSettings(*ctype);
     for (const SettingInfo& ssi : settings)
@@ -1597,11 +2055,6 @@ void CommonHostInterface::ApplyInputProfile(const char* profile_path, SettingsIn
         si.SetStringValue(section_name, ssi.key, value.c_str());
     }
   }
-
-  if (System::IsValid())
-    System::UpdateControllers();
-
-  UpdateInputMap(si);
 
   ReportFormattedMessage(TranslateString("OSDMessage", "Loaded input profile from '%s'"), profile_path);
 }
@@ -1636,15 +2089,18 @@ bool CommonHostInterface::SaveInputProfile(const char* profile_path, SettingsInt
 
     for (const auto& axis : Controller::GetAxisNames(ctype))
     {
-      const auto key_name = TinyString::FromFormat("Axis%s", axis.first.c_str());
+      const auto key_name = TinyString::FromFormat("Axis%s", std::get<std::string>(axis).c_str());
       const std::vector<std::string> bindings = si.GetStringList(section_name, key_name);
       for (const std::string& binding : bindings)
         profile.AddToStringList(section_name, key_name, binding.c_str());
     }
 
-    const std::string rumble_value = si.GetStringValue(section_name, "Rumble");
-    if (!rumble_value.empty())
-      profile.SetStringValue(section_name, "Rumble", rumble_value.c_str());
+    if (Controller::GetVibrationMotorCount(ctype) > 0)
+    {
+      const std::string rumble_value = si.GetStringValue(section_name, "Rumble");
+      if (!rumble_value.empty())
+        profile.SetStringValue(section_name, "Rumble", rumble_value.c_str());
+    }
 
     Controller::SettingList settings = Controller::GetSettings(ctype);
     for (const SettingInfo& ssi : settings)
@@ -1661,29 +2117,40 @@ bool CommonHostInterface::SaveInputProfile(const char* profile_path, SettingsInt
     return false;
   }
 
-  Log_SuccessPrintf("Input profile saved to '%s'", profile_path);
+  Log_InfoPrintf("Input profile saved to '%s'", profile_path);
   return true;
 }
 
 std::string CommonHostInterface::GetSettingsFileName() const
 {
+  if (!m_settings_filename.empty())
+  {
+    if (!FileSystem::FileExists(m_settings_filename.c_str()))
+    {
+      Log_ErrorPrintf("Could not find settings file %s, using default", m_settings_filename.c_str());
+    }
+    else
+    {
+      return GetUserDirectoryRelativePath(m_settings_filename.c_str());
+    }
+  }
   return GetUserDirectoryRelativePath("settings.ini");
 }
 
 std::string CommonHostInterface::GetGameSaveStateFileName(const char* game_code, s32 slot) const
 {
   if (slot < 0)
-    return GetUserDirectoryRelativePath("savestates/%s_resume.sav", game_code);
+    return GetUserDirectoryRelativePath("savestates" FS_OSPATH_SEPARATOR_STR "%s_resume.sav", game_code);
   else
-    return GetUserDirectoryRelativePath("savestates/%s_%d.sav", game_code, slot);
+    return GetUserDirectoryRelativePath("savestates" FS_OSPATH_SEPARATOR_STR "%s_%d.sav", game_code, slot);
 }
 
 std::string CommonHostInterface::GetGlobalSaveStateFileName(s32 slot) const
 {
   if (slot < 0)
-    return GetUserDirectoryRelativePath("savestates/resume.sav");
+    return GetUserDirectoryRelativePath("savestates" FS_OSPATH_SEPARATOR_STR "resume.sav");
   else
-    return GetUserDirectoryRelativePath("savestates/savestate_%d.sav", slot);
+    return GetUserDirectoryRelativePath("savestates" FS_OSPATH_SEPARATOR_STR "savestate_%d.sav", slot);
 }
 
 std::vector<CommonHostInterface::SaveStateInfo> CommonHostInterface::GetAvailableSaveStates(const char* game_code) const
@@ -1749,10 +2216,12 @@ CommonHostInterface::GetExtendedSaveStateInfo(const char* game_code, s32 slot)
   ssi.slot = slot;
   ssi.global = global;
 
-  if (header.version != SAVE_STATE_VERSION)
+  if (header.version < SAVE_STATE_MINIMUM_VERSION || header.version > SAVE_STATE_VERSION)
   {
-    ssi.title = StringUtil::StdStringFromFormat("Invalid version %u (expected %u)", header.version, header.magic,
-                                                SAVE_STATE_VERSION);
+    ssi.title = StringUtil::StdStringFromFormat(
+      TranslateString("CommonHostInterface", "Invalid version %u (%s version %u)"), header.version,
+      header.version > SAVE_STATE_VERSION ? "maximum" : "minimum",
+      header.version > SAVE_STATE_VERSION ? SAVE_STATE_VERSION : SAVE_STATE_MINIMUM_VERSION);
     return ssi;
   }
 
@@ -1761,9 +2230,19 @@ CommonHostInterface::GetExtendedSaveStateInfo(const char* game_code, s32 slot)
   header.game_code[sizeof(header.game_code) - 1] = 0;
   ssi.game_code = header.game_code;
 
+  if (header.media_filename_length > 0 &&
+      (header.offset_to_media_filename + header.media_filename_length) <= stream->GetSize())
+  {
+    stream->SeekAbsolute(header.offset_to_media_filename);
+    ssi.media_path.resize(header.media_filename_length);
+    if (!stream->Read2(ssi.media_path.data(), header.media_filename_length))
+      std::string().swap(ssi.media_path);
+  }
+
   if (header.screenshot_width > 0 && header.screenshot_height > 0 && header.screenshot_size > 0 &&
       (static_cast<u64>(header.offset_to_screenshot) + static_cast<u64>(header.screenshot_size)) <= stream->GetSize())
   {
+    stream->SeekAbsolute(header.offset_to_screenshot);
     ssi.screenshot_data.resize((header.screenshot_size + 3u) / 4u);
     if (stream->Read2(ssi.screenshot_data.data(), header.screenshot_size))
     {
@@ -1813,22 +2292,28 @@ std::string CommonHostInterface::GetMostRecentResumeSaveStatePath() const
   return std::move(most_recent->FileName);
 }
 
-void CommonHostInterface::CheckSettings(SettingsInterface& si)
+bool CommonHostInterface::CheckSettings(SettingsInterface& si)
 {
   const int settings_version = si.GetIntValue("Main", "SettingsVersion", -1);
   if (settings_version == SETTINGS_VERSION)
-    return;
+    return true;
 
-  ReportFormattedError("Settings version %d does not match expected version %d, resetting", settings_version,
-                       SETTINGS_VERSION);
+  Log_ErrorPrintf("Settings version %d does not match expected version %d, resetting", settings_version,
+                  SETTINGS_VERSION);
+
   si.Clear();
   si.SetIntValue("Main", "SettingsVersion", SETTINGS_VERSION);
   SetDefaultSettings(si);
+  return false;
 }
 
 void CommonHostInterface::SetDefaultSettings(SettingsInterface& si)
 {
   HostInterface::SetDefaultSettings(si);
+
+  // TODO: Maybe we should bind this to F1 in the future.
+  if (m_fullscreen_ui_enabled)
+    si.SetStringValue("Hotkeys", "OpenQuickMenu", "Keyboard/Escape");
 
   si.SetStringValue("Controller1", "ButtonUp", "Keyboard/W");
   si.SetStringValue("Controller1", "ButtonDown", "Keyboard/S");
@@ -1847,11 +2332,6 @@ void CommonHostInterface::SetDefaultSettings(SettingsInterface& si)
   si.SetStringValue("Hotkeys", "FastForward", "Keyboard/Tab");
   si.SetStringValue("Hotkeys", "TogglePause", "Keyboard/Pause");
   si.SetStringValue("Hotkeys", "ToggleFullscreen", "Keyboard/Alt+Return");
-  si.SetStringValue("Hotkeys", "PowerOff", "Keyboard/Escape");
-  si.SetStringValue("Hotkeys", "LoadSelectedSaveState", "Keyboard/F1");
-  si.SetStringValue("Hotkeys", "SaveSelectedSaveState", "Keyboard/F2");
-  si.SetStringValue("Hotkeys", "SelectPreviousSaveStateSlot", "Keyboard/F3");
-  si.SetStringValue("Hotkeys", "SelectNextSaveStateSlot", "Keyboard/F4");
   si.SetStringValue("Hotkeys", "Screenshot", "Keyboard/F10");
   si.SetStringValue("Hotkeys", "IncreaseResolutionScale", "Keyboard/PageUp");
   si.SetStringValue("Hotkeys", "DecreaseResolutionScale", "Keyboard/PageDown");
@@ -1891,11 +2371,29 @@ void CommonHostInterface::CheckForSettingsChanges(const Settings& old_settings)
         g_settings.audio_buffer_size != old_settings.audio_buffer_size ||
         g_settings.video_sync_enabled != old_settings.video_sync_enabled ||
         g_settings.audio_sync_enabled != old_settings.audio_sync_enabled ||
-        g_settings.speed_limiter_enabled != old_settings.speed_limiter_enabled ||
         g_settings.increase_timer_resolution != old_settings.increase_timer_resolution ||
-        g_settings.emulation_speed != old_settings.emulation_speed)
+        g_settings.emulation_speed != old_settings.emulation_speed ||
+        g_settings.fast_forward_speed != old_settings.fast_forward_speed ||
+        g_settings.display_max_fps != old_settings.display_max_fps ||
+        g_settings.display_all_frames != old_settings.display_all_frames ||
+        g_settings.audio_resampling != old_settings.audio_resampling ||
+        g_settings.sync_to_host_refresh_rate != old_settings.sync_to_host_refresh_rate)
     {
       UpdateSpeedLimiterState();
+    }
+
+    if (g_settings.display_post_processing != old_settings.display_post_processing ||
+        g_settings.display_post_process_chain != old_settings.display_post_process_chain)
+    {
+      if (g_settings.display_post_processing)
+      {
+        if (!m_display->SetPostProcessingChain(g_settings.display_post_process_chain))
+          AddOSDMessage(TranslateStdString("OSDMessage", "Failed to load post processing shader chain."), 20.0f);
+      }
+      else
+      {
+        m_display->SetPostProcessingChain({});
+      }
     }
   }
 
@@ -1935,12 +2433,28 @@ void CommonHostInterface::DisplayLoadingScreen(const char* message, int progress
   const bool has_progress = (progress_min < progress_max);
 
   // eat the last imgui frame, it might've been partially rendered by the caller.
-  // ImGui::EndFrame();
-  // ImGui::NewFrame();
+  ImGui::NewFrame();
+
+  const float logo_width = static_cast<float>(APP_ICON_WIDTH) * scale;
+  const float logo_height = static_cast<float>(APP_ICON_HEIGHT) * scale;
+
+  ImGui::SetNextWindowSize(ImVec2(logo_width, logo_height), ImGuiCond_Always);
+  ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, (io.DisplaySize.y * 0.5f) - (50.0f * scale)),
+                          ImGuiCond_Always, ImVec2(0.5f, 0.5f));
+  if (ImGui::Begin("LoadingScreenLogo", nullptr,
+                   ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoInputs | ImGuiWindowFlags_NoMove |
+                     ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoNav |
+                     ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoFocusOnAppearing |
+                     ImGuiWindowFlags_NoBackground))
+  {
+    if (m_logo_texture)
+      ImGui::Image(m_logo_texture->GetHandle(), ImVec2(logo_width, logo_height));
+  }
+  ImGui::End();
 
   ImGui::SetNextWindowSize(ImVec2(width, (has_progress ? 50.0f : 30.0f) * scale), ImGuiCond_Always);
-  ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.5f), ImGuiCond_Always,
-                          ImVec2(0.5f, 0.5f));
+  ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, (io.DisplaySize.y * 0.5f) + (100.0f * scale)),
+                          ImGuiCond_Always, ImVec2(0.5f, 0.0f));
   if (ImGui::Begin("LoadingScreen", nullptr,
                    ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoInputs | ImGuiWindowFlags_NoMove |
                      ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoNav |
@@ -1963,8 +2477,8 @@ void CommonHostInterface::DisplayLoadingScreen(const char* message, int progress
   }
   ImGui::End();
 
+  ImGui::EndFrame();
   m_display->Render();
-  ImGui::NewFrame();
 }
 
 void CommonHostInterface::GetGameInfo(const char* path, CDImage* image, std::string* code, std::string* title)
@@ -1978,13 +2492,13 @@ void CommonHostInterface::GetGameInfo(const char* path, CDImage* image, std::str
   else
   {
     if (image)
-      *code = GameList::GetGameCodeForImage(image);
+      *code = System::GetGameCodeForImage(image);
 
     const GameListDatabaseEntry* db_entry = (!code->empty()) ? m_game_list->GetDatabaseEntryForCode(*code) : nullptr;
     if (db_entry)
       *title = db_entry->title;
     else
-      *title = GameList::GetTitleForPath(path);
+      *title = System::GetTitleForPath(path);
   }
 }
 
@@ -2026,12 +2540,12 @@ bool CommonHostInterface::StartDumpingAudio(const char* filename)
 
   if (g_spu.StartDumpingAudio(filename))
   {
-    AddFormattedOSDMessage(5.0f, "Started dumping audio to '%s'.", filename);
+    AddFormattedOSDMessage(5.0f, TranslateString("OSDMessage", "Started dumping audio to '%s'."), filename);
     return true;
   }
   else
   {
-    AddFormattedOSDMessage(10.0f, "Failed to start dumping audio to '%s'.", filename);
+    AddFormattedOSDMessage(10.0f, TranslateString("OSDMessage", "Failed to start dumping audio to '%s'."), filename);
     return false;
   }
 }
@@ -2041,11 +2555,11 @@ void CommonHostInterface::StopDumpingAudio()
   if (System::IsShutdown() || !g_spu.StopDumpingAudio())
     return;
 
-  AddOSDMessage("Stopped dumping audio.", 5.0f);
+  AddOSDMessage(TranslateStdString("OSDMessage", "Stopped dumping audio."), 5.0f);
 }
 
 bool CommonHostInterface::SaveScreenshot(const char* filename /* = nullptr */, bool full_resolution /* = true */,
-                                         bool apply_aspect_ratio /* = true */)
+                                         bool apply_aspect_ratio /* = true */, bool compress_on_thread /* = true */)
 {
   if (System::IsShutdown())
     return false;
@@ -2057,19 +2571,26 @@ bool CommonHostInterface::SaveScreenshot(const char* filename /* = nullptr */, b
     const char* extension = "png";
     if (code.empty())
     {
-      auto_filename =
-        GetUserDirectoryRelativePath("screenshots/%s.%s", GetTimestampStringForFileName().GetCharArray(), extension);
+      auto_filename = GetUserDirectoryRelativePath("screenshots" FS_OSPATH_SEPARATOR_STR "%s.%s",
+                                                   GetTimestampStringForFileName().GetCharArray(), extension);
     }
     else
     {
-      auto_filename = GetUserDirectoryRelativePath("screenshots/%s_%s.%s", code.c_str(),
+      auto_filename = GetUserDirectoryRelativePath("screenshots" FS_OSPATH_SEPARATOR_STR "%s_%s.%s", code.c_str(),
                                                    GetTimestampStringForFileName().GetCharArray(), extension);
     }
 
     filename = auto_filename.c_str();
   }
 
-  const bool screenshot_saved = m_display->WriteDisplayTextureToFile(filename, full_resolution, apply_aspect_ratio);
+  if (FileSystem::FileExists(filename))
+  {
+    AddFormattedOSDMessage(10.0f, TranslateString("OSDMessage", "Screenshot file '%s' already exists."), filename);
+    return false;
+  }
+
+  const bool screenshot_saved =
+    m_display->WriteDisplayTextureToFile(filename, full_resolution, apply_aspect_ratio, compress_on_thread);
   if (!screenshot_saved)
   {
     AddFormattedOSDMessage(10.0f, TranslateString("OSDMessage", "Failed to save screenshot to '%s'"), filename);
@@ -2089,6 +2610,285 @@ void CommonHostInterface::ApplyGameSettings(bool display_osd_messages)
   const GameSettings::Entry* gs = m_game_list->GetGameSettings(System::GetRunningPath(), System::GetRunningCode());
   if (gs)
     gs->ApplySettings(display_osd_messages);
+}
+
+bool CommonHostInterface::UpdateControllerInputMapFromGameSettings()
+{
+  // this gets called while booting, so can't use valid
+  if (System::IsShutdown() || System::GetRunningCode().empty() || !g_settings.apply_game_settings)
+    return false;
+
+  const GameSettings::Entry* gs = m_game_list->GetGameSettings(System::GetRunningPath(), System::GetRunningCode());
+  if (!gs || gs->input_profile_name.empty())
+    return false;
+
+  std::string path = GetInputProfilePath(gs->input_profile_name.c_str());
+  if (path.empty())
+  {
+    AddFormattedOSDMessage(10.0f, TranslateString("OSDMessage", "Input profile '%s' cannot be found."),
+                           gs->input_profile_name.c_str());
+    return false;
+  }
+
+  if (System::GetState() == System::State::Starting)
+  {
+    AddFormattedOSDMessage(5.0f, TranslateString("OSDMessage", "Using input profile '%s'."),
+                           gs->input_profile_name.c_str());
+  }
+
+  INISettingsInterface si(std::move(path));
+  UpdateControllerInputMap(si);
+  return true;
+}
+
+std::string CommonHostInterface::GetCheatFileName() const
+{
+  const std::string& title = System::GetRunningTitle();
+  if (title.empty())
+    return {};
+
+  return GetUserDirectoryRelativePath("cheats/%s.cht", title.c_str());
+}
+
+bool CommonHostInterface::LoadCheatList(const char* filename)
+{
+  if (System::IsShutdown())
+    return false;
+
+  std::unique_ptr<CheatList> cl = std::make_unique<CheatList>();
+  if (!cl->LoadFromFile(filename, CheatList::Format::Autodetect))
+  {
+    AddFormattedOSDMessage(15.0f, TranslateString("OSDMessage", "Failed to load cheats from '%s'."), filename);
+    return false;
+  }
+
+  AddFormattedOSDMessage(10.0f, TranslateString("OSDMessage", "Loaded %u cheats from list. %u cheats are enabled."),
+                         cl->GetCodeCount(), cl->GetEnabledCodeCount());
+  System::SetCheatList(std::move(cl));
+  return true;
+}
+
+bool CommonHostInterface::LoadCheatListFromGameTitle()
+{
+  const std::string filename(GetCheatFileName());
+  if (filename.empty() || !FileSystem::FileExists(filename.c_str()))
+    return false;
+
+  return LoadCheatList(filename.c_str());
+}
+
+bool CommonHostInterface::LoadCheatListFromDatabase()
+{
+  if (System::GetRunningCode().empty())
+    return false;
+
+  std::unique_ptr<CheatList> cl = std::make_unique<CheatList>();
+  if (!cl->LoadFromPackage(System::GetRunningCode()))
+    return false;
+
+  AddFormattedOSDMessage(10.0f, TranslateString("OSDMessage", "Loaded %u cheats from database."), cl->GetCodeCount());
+  System::SetCheatList(std::move(cl));
+  return true;
+}
+
+bool CommonHostInterface::SaveCheatList()
+{
+  if (!System::IsValid() || !System::HasCheatList())
+    return false;
+
+  const std::string filename(GetCheatFileName());
+  if (filename.empty())
+    return false;
+
+  if (!System::GetCheatList()->SaveToPCSXRFile(filename.c_str()))
+  {
+    AddFormattedOSDMessage(15.0f, TranslateString("OSDMessage", "Failed to save cheat list to '%s'"), filename.c_str());
+  }
+
+  return true;
+}
+
+bool CommonHostInterface::SaveCheatList(const char* filename)
+{
+  if (!System::IsValid() || !System::HasCheatList())
+    return false;
+
+  if (!System::GetCheatList()->SaveToPCSXRFile(filename))
+    return false;
+
+  AddFormattedOSDMessage(5.0f, TranslateString("OSDMessage", "Saved %u cheats to '%s'."),
+                         System::GetCheatList()->GetCodeCount(), filename);
+  return true;
+}
+
+void CommonHostInterface::SetCheatCodeState(u32 index, bool enabled, bool save_to_file)
+{
+  if (!System::IsValid() || !System::HasCheatList())
+    return;
+
+  CheatList* cl = System::GetCheatList();
+  if (index >= cl->GetCodeCount())
+    return;
+
+  CheatCode& cc = cl->GetCode(index);
+  if (cc.enabled == enabled)
+    return;
+
+  cc.enabled = enabled;
+
+  if (enabled)
+  {
+    AddFormattedOSDMessage(5.0f, TranslateString("OSDMessage", "Cheat '%s' enabled."), cc.description.c_str());
+  }
+  else
+  {
+    AddFormattedOSDMessage(5.0f, TranslateString("OSDMessage", "Cheat '%s' disabled."), cc.description.c_str());
+  }
+
+  if (save_to_file)
+    SaveCheatList();
+}
+
+void CommonHostInterface::ApplyCheatCode(u32 index)
+{
+  if (!System::HasCheatList() || index >= System::GetCheatList()->GetCodeCount())
+    return;
+
+  const CheatCode& cc = System::GetCheatList()->GetCode(index);
+  if (!cc.enabled)
+  {
+    cc.Apply();
+    AddFormattedOSDMessage(5.0f, TranslateString("OSDMessage", "Applied cheat '%s'."), cc.description.c_str());
+  }
+  else
+  {
+    AddFormattedOSDMessage(5.0f, TranslateString("OSDMessage", "Cheat '%s' is already enabled."),
+                           cc.description.c_str());
+  }
+}
+
+void CommonHostInterface::TogglePostProcessing()
+{
+  if (!m_display)
+    return;
+
+  g_settings.display_post_processing = !g_settings.display_post_processing;
+  if (g_settings.display_post_processing)
+  {
+    AddOSDMessage(TranslateStdString("OSDMessage", "Post-processing is now enabled."), 10.0f);
+
+    if (!m_display->SetPostProcessingChain(g_settings.display_post_process_chain))
+      AddOSDMessage(TranslateStdString("OSDMessage", "Failed to load post processing shader chain."), 20.0f);
+  }
+  else
+  {
+    AddOSDMessage(TranslateStdString("OSDMessage", "Post-processing is now disabled."), 10.0f);
+    m_display->SetPostProcessingChain({});
+  }
+}
+
+void CommonHostInterface::ReloadPostProcessingShaders()
+{
+  if (!m_display || !g_settings.display_post_processing)
+    return;
+
+  if (!m_display->SetPostProcessingChain(g_settings.display_post_process_chain))
+    AddOSDMessage(TranslateStdString("OSDMessage", "Failed to load post-processing shader chain."), 20.0f);
+  else
+    AddOSDMessage(TranslateStdString("OSDMessage", "Post-processing shaders reloaded."), 10.0f);
+}
+
+bool CommonHostInterface::ParseFullscreenMode(const std::string_view& mode, u32* width, u32* height,
+                                              float* refresh_rate)
+{
+  if (!mode.empty())
+  {
+    std::string_view::size_type sep1 = mode.find('x');
+    if (sep1 != std::string_view::npos)
+    {
+      std::optional<u32> owidth = StringUtil::FromChars<u32>(mode.substr(0, sep1));
+      sep1++;
+
+      while (sep1 < mode.length() && std::isspace(mode[sep1]))
+        sep1++;
+
+      if (owidth.has_value() && sep1 < mode.length())
+      {
+        std::string_view::size_type sep2 = mode.find('@', sep1);
+        if (sep2 != std::string_view::npos)
+        {
+          std::optional<u32> oheight = StringUtil::FromChars<u32>(mode.substr(sep1, sep2 - sep1));
+          sep2++;
+
+          while (sep2 < mode.length() && std::isspace(mode[sep2]))
+            sep2++;
+
+          if (oheight.has_value() && sep2 < mode.length())
+          {
+            std::optional<float> orefresh_rate = StringUtil::FromChars<float>(mode.substr(sep2));
+            if (orefresh_rate.has_value())
+            {
+              *width = owidth.value();
+              *height = oheight.value();
+              *refresh_rate = orefresh_rate.value();
+              return true;
+            }
+          }
+        }
+      }
+    }
+  }
+
+  *width = 0;
+  *height = 0;
+  *refresh_rate = 0;
+  return false;
+}
+
+bool CommonHostInterface::RequestRenderWindowSize(s32 new_window_width, s32 new_window_height)
+{
+  return false;
+}
+
+bool CommonHostInterface::RequestRenderWindowScale(float scale)
+{
+  if (!System::IsValid() || scale == 0)
+    return false;
+
+  const float y_scale =
+    (static_cast<float>(m_display->GetDisplayWidth()) / static_cast<float>(m_display->GetDisplayHeight())) /
+    m_display->GetDisplayAspectRatio();
+
+  const u32 requested_width =
+    std::max<u32>(static_cast<u32>(std::ceil(static_cast<float>(m_display->GetDisplayWidth()) * scale)), 1);
+  const u32 requested_height =
+    std::max<u32>(static_cast<u32>(std::ceil(static_cast<float>(m_display->GetDisplayHeight()) * y_scale * scale)), 1);
+
+  return RequestRenderWindowSize(static_cast<s32>(requested_width), static_cast<s32>(requested_height));
+}
+
+void* CommonHostInterface::GetTopLevelWindowHandle() const
+{
+  return nullptr;
+}
+
+std::unique_ptr<ByteStream> CommonHostInterface::OpenPackageFile(const char* path, u32 flags)
+{
+  const u32 allowed_flags = (BYTESTREAM_OPEN_READ | BYTESTREAM_OPEN_SEEKABLE | BYTESTREAM_OPEN_STREAMED);
+  const std::string full_path(
+    StringUtil::StdStringFromFormat("%s" FS_OSPATH_SEPARATOR_STR "%s", m_program_directory.c_str(), path));
+  const u32 real_flags = (flags & allowed_flags) | BYTESTREAM_OPEN_READ;
+  Log_DevPrintf("Requesting package file '%s'", path);
+  return FileSystem::OpenFile(full_path.c_str(), real_flags);
+}
+
+bool CommonHostInterface::SetControllerNavigationButtonState(FrontendCommon::ControllerNavigationButton button,
+                                                             bool pressed)
+{
+  if (!m_fullscreen_ui_enabled)
+    return false;
+
+  return FullscreenUI::SetControllerNavInput(button, pressed);
 }
 
 #ifdef WITH_DISCORD_PRESENCE
@@ -2139,7 +2939,7 @@ void CommonHostInterface::UpdateDiscordPresence()
   rp.startTimestamp = std::time(nullptr);
 
   SmallString details_string;
-  if (System::IsValid())
+  if (!System::IsShutdown())
   {
     details_string.AppendFormattedString("%s (%s)", System::GetRunningTitle().c_str(),
                                          System::GetRunningCode().c_str());

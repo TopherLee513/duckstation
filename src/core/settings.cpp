@@ -1,11 +1,16 @@
 #include "settings.h"
+#include "common/file_system.h"
 #include "common/make_array.h"
 #include "common/string_util.h"
 #include "host_interface.h"
 #include <algorithm>
 #include <array>
+#include <cctype>
+#include <numeric>
 
 Settings g_settings;
+
+SettingsInterface::~SettingsInterface() = default;
 
 const char* SettingInfo::StringDefaultValue() const
 {
@@ -72,43 +77,103 @@ bool Settings::HasAnyPerGameMemoryCards() const
   });
 }
 
+void Settings::CPUOverclockPercentToFraction(u32 percent, u32* numerator, u32* denominator)
+{
+  const u32 percent_gcd = std::gcd(percent, 100);
+  *numerator = percent / percent_gcd;
+  *denominator = 100u / percent_gcd;
+}
+
+u32 Settings::CPUOverclockFractionToPercent(u32 numerator, u32 denominator)
+{
+  return (numerator * 100u) / denominator;
+}
+
+void Settings::SetCPUOverclockPercent(u32 percent)
+{
+  CPUOverclockPercentToFraction(percent, &cpu_overclock_numerator, &cpu_overclock_denominator);
+}
+
+u32 Settings::GetCPUOverclockPercent() const
+{
+  return CPUOverclockFractionToPercent(cpu_overclock_numerator, cpu_overclock_denominator);
+}
+
+void Settings::UpdateOverclockActive()
+{
+  cpu_overclock_active = (cpu_overclock_enable && (cpu_overclock_numerator != 1 || cpu_overclock_denominator != 1));
+}
+
 void Settings::Load(SettingsInterface& si)
 {
   region =
     ParseConsoleRegionName(si.GetStringValue("Console", "Region", "NTSC-U").c_str()).value_or(DEFAULT_CONSOLE_REGION);
 
   emulation_speed = si.GetFloatValue("Main", "EmulationSpeed", 1.0f);
-  speed_limiter_enabled = si.GetBoolValue("Main", "SpeedLimiterEnabled", true);
+  fast_forward_speed = si.GetFloatValue("Main", "FastForwardSpeed", 0.0f);
+  turbo_speed = si.GetFloatValue("Main", "TurboSpeed", 0.0f);
+  sync_to_host_refresh_rate = si.GetBoolValue("Main", "SyncToHostRefreshRate", false);
   increase_timer_resolution = si.GetBoolValue("Main", "IncreaseTimerResolution", true);
   start_paused = si.GetBoolValue("Main", "StartPaused", false);
   start_fullscreen = si.GetBoolValue("Main", "StartFullscreen", false);
+  pause_on_focus_loss = si.GetBoolValue("Main", "PauseOnFocusLoss", false);
   save_state_on_exit = si.GetBoolValue("Main", "SaveStateOnExit", true);
   confim_power_off = si.GetBoolValue("Main", "ConfirmPowerOff", true);
   load_devices_from_save_states = si.GetBoolValue("Main", "LoadDevicesFromSaveStates", false);
   apply_game_settings = si.GetBoolValue("Main", "ApplyGameSettings", true);
+  auto_load_cheats = si.GetBoolValue("Main", "AutoLoadCheats", false);
+  disable_all_enhancements = si.GetBoolValue("Main", "DisableAllEnhancements", false);
+  rewind_enable = si.GetBoolValue("Main", "RewindEnable", false);
+  rewind_save_frequency = si.GetFloatValue("Main", "RewindFrequency", 10.0f);
+  rewind_save_slots = static_cast<u32>(si.GetIntValue("Main", "RewindSaveSlots", 10));
+  runahead_frames = static_cast<u32>(si.GetIntValue("Main", "RunaheadFrameCount", 0));
 
   cpu_execution_mode =
     ParseCPUExecutionMode(
       si.GetStringValue("CPU", "ExecutionMode", GetCPUExecutionModeName(DEFAULT_CPU_EXECUTION_MODE)).c_str())
       .value_or(DEFAULT_CPU_EXECUTION_MODE);
+  cpu_overclock_numerator = std::max(si.GetIntValue("CPU", "OverclockNumerator", 1), 1);
+  cpu_overclock_denominator = std::max(si.GetIntValue("CPU", "OverclockDenominator", 1), 1);
+  cpu_overclock_enable = si.GetBoolValue("CPU", "OverclockEnable", false);
+  UpdateOverclockActive();
   cpu_recompiler_memory_exceptions = si.GetBoolValue("CPU", "RecompilerMemoryExceptions", false);
+  cpu_recompiler_icache = si.GetBoolValue("CPU", "RecompilerICache", false);
+  cpu_fastmem_mode = ParseCPUFastmemMode(
+                       si.GetStringValue("CPU", "FastmemMode", GetCPUFastmemModeName(DEFAULT_CPU_FASTMEM_MODE)).c_str())
+                       .value_or(DEFAULT_CPU_FASTMEM_MODE);
 
   gpu_renderer = ParseRendererName(si.GetStringValue("GPU", "Renderer", GetRendererName(DEFAULT_GPU_RENDERER)).c_str())
                    .value_or(DEFAULT_GPU_RENDERER);
   gpu_adapter = si.GetStringValue("GPU", "Adapter", "");
   gpu_resolution_scale = static_cast<u32>(si.GetIntValue("GPU", "ResolutionScale", 1));
+  gpu_multisamples = static_cast<u32>(si.GetIntValue("GPU", "Multisamples", 1));
   gpu_use_debug_device = si.GetBoolValue("GPU", "UseDebugDevice", false);
+  gpu_per_sample_shading = si.GetBoolValue("GPU", "PerSampleShading", false);
+  gpu_use_thread = si.GetBoolValue("GPU", "UseThread", true);
+  gpu_threaded_presentation = si.GetBoolValue("GPU", "ThreadedPresentation", true);
   gpu_true_color = si.GetBoolValue("GPU", "TrueColor", true);
   gpu_scaled_dithering = si.GetBoolValue("GPU", "ScaledDithering", false);
-  gpu_texture_filtering = si.GetBoolValue("GPU", "TextureFiltering", false);
-  gpu_disable_interlacing = si.GetBoolValue("GPU", "DisableInterlacing", false);
+  gpu_texture_filter =
+    ParseTextureFilterName(
+      si.GetStringValue("GPU", "TextureFilter", GetTextureFilterName(DEFAULT_GPU_TEXTURE_FILTER)).c_str())
+      .value_or(DEFAULT_GPU_TEXTURE_FILTER);
+  gpu_downsample_mode =
+    ParseDownsampleModeName(
+      si.GetStringValue("GPU", "DownsampleMode", GetDownsampleModeName(DEFAULT_GPU_DOWNSAMPLE_MODE)).c_str())
+      .value_or(DEFAULT_GPU_DOWNSAMPLE_MODE);
+  gpu_disable_interlacing = si.GetBoolValue("GPU", "DisableInterlacing", true);
   gpu_force_ntsc_timings = si.GetBoolValue("GPU", "ForceNTSCTimings", false);
   gpu_widescreen_hack = si.GetBoolValue("GPU", "WidescreenHack", false);
+  gpu_24bit_chroma_smoothing = si.GetBoolValue("GPU", "ChromaSmoothing24Bit", false);
   gpu_pgxp_enable = si.GetBoolValue("GPU", "PGXPEnable", false);
   gpu_pgxp_culling = si.GetBoolValue("GPU", "PGXPCulling", true);
   gpu_pgxp_texture_correction = si.GetBoolValue("GPU", "PGXPTextureCorrection", true);
   gpu_pgxp_vertex_cache = si.GetBoolValue("GPU", "PGXPVertexCache", false);
   gpu_pgxp_cpu = si.GetBoolValue("GPU", "PGXPCPU", false);
+  gpu_pgxp_preserve_proj_fp = si.GetBoolValue("GPU", "PGXPPreserveProjFP", false);
+  gpu_pgxp_tolerance = si.GetFloatValue("GPU", "PGXPTolerance", -1.0f);
+  gpu_pgxp_depth_buffer = si.GetBoolValue("GPU", "PGXPDepthBuffer", false);
+  SetPGXPDepthClearThreshold(si.GetFloatValue("GPU", "PGXPDepthClearThreshold", DEFAULT_GPU_PGXP_DEPTH_THRESHOLD));
 
   display_crop_mode =
     ParseDisplayCropMode(
@@ -118,26 +183,37 @@ void Settings::Load(SettingsInterface& si)
     ParseDisplayAspectRatio(
       si.GetStringValue("Display", "AspectRatio", GetDisplayAspectRatioName(DEFAULT_DISPLAY_ASPECT_RATIO)).c_str())
       .value_or(DEFAULT_DISPLAY_ASPECT_RATIO);
+  display_force_4_3_for_24bit = si.GetBoolValue("Display", "Force4_3For24Bit", false);
   display_active_start_offset = static_cast<s16>(si.GetIntValue("Display", "ActiveStartOffset", 0));
   display_active_end_offset = static_cast<s16>(si.GetIntValue("Display", "ActiveEndOffset", 0));
+  display_line_start_offset = static_cast<s8>(si.GetIntValue("Display", "LineStartOffset", 0));
+  display_line_end_offset = static_cast<s8>(si.GetIntValue("Display", "LineEndOffset", 0));
   display_linear_filtering = si.GetBoolValue("Display", "LinearFiltering", true);
   display_integer_scaling = si.GetBoolValue("Display", "IntegerScaling", false);
+  display_post_processing = si.GetBoolValue("Display", "PostProcessing", false);
   display_show_osd_messages = si.GetBoolValue("Display", "ShowOSDMessages", true);
   display_show_fps = si.GetBoolValue("Display", "ShowFPS", false);
   display_show_vps = si.GetBoolValue("Display", "ShowVPS", false);
   display_show_speed = si.GetBoolValue("Display", "ShowSpeed", false);
   display_show_resolution = si.GetBoolValue("Display", "ShowResolution", false);
+  display_all_frames = si.GetBoolValue("Display", "DisplayAllFrames", false);
   video_sync_enabled = si.GetBoolValue("Display", "VSync", true);
+  display_post_process_chain = si.GetStringValue("Display", "PostProcessChain", "");
+  display_max_fps = si.GetFloatValue("Display", "MaxFPS", 0.0f);
 
   cdrom_read_thread = si.GetBoolValue("CDROM", "ReadThread", true);
   cdrom_region_check = si.GetBoolValue("CDROM", "RegionCheck", true);
   cdrom_load_image_to_ram = si.GetBoolValue("CDROM", "LoadImageToRAM", false);
+  cdrom_mute_cd_audio = si.GetBoolValue("CDROM", "MuteCDAudio", false);
+  cdrom_read_speedup = si.GetIntValue("CDROM", "ReadSpeedup", 1);
 
   audio_backend =
     ParseAudioBackend(si.GetStringValue("Audio", "Backend", GetAudioBackendName(DEFAULT_AUDIO_BACKEND)).c_str())
       .value_or(DEFAULT_AUDIO_BACKEND);
   audio_output_volume = si.GetIntValue("Audio", "OutputVolume", 100);
+  audio_fast_forward_volume = si.GetIntValue("Audio", "FastForwardVolume", 100);
   audio_buffer_size = si.GetIntValue("Audio", "BufferSize", HostInterface::DEFAULT_AUDIO_BUFFER_SIZE);
+  audio_resampling = si.GetBoolValue("Audio", "Resampling", true);
   audio_output_muted = si.GetBoolValue("Audio", "OutputMuted", false);
   audio_sync_enabled = si.GetBoolValue("Audio", "Sync", true);
   audio_dump_on_boot = si.GetBoolValue("Audio", "DumpOnBoot", false);
@@ -147,7 +223,6 @@ void Settings::Load(SettingsInterface& si)
   gpu_fifo_size = static_cast<u32>(si.GetIntValue("Hacks", "GPUFIFOSize", DEFAULT_GPU_FIFO_SIZE));
   gpu_max_run_ahead = si.GetIntValue("Hacks", "GPUMaxRunAhead", DEFAULT_GPU_MAX_RUN_AHEAD);
 
-  bios_path = si.GetStringValue("BIOS", "Path", "bios/scph1001.bin");
   bios_patch_tty_enable = si.GetBoolValue("BIOS", "PatchTTYEnable", false);
   bios_patch_fast_boot = si.GetBoolValue("BIOS", "PatchFastBoot", false);
 
@@ -159,17 +234,20 @@ void Settings::Load(SettingsInterface& si)
     ParseControllerTypeName(
       si.GetStringValue("Controller2", "Type", GetControllerTypeName(DEFAULT_CONTROLLER_2_TYPE)).c_str())
       .value_or(DEFAULT_CONTROLLER_2_TYPE);
+  controller_disable_analog_mode_forcing = false;
 
   memory_card_types[0] =
     ParseMemoryCardTypeName(
       si.GetStringValue("MemoryCards", "Card1Type", GetMemoryCardTypeName(DEFAULT_MEMORY_CARD_1_TYPE)).c_str())
       .value_or(DEFAULT_MEMORY_CARD_1_TYPE);
-  memory_card_paths[0] = si.GetStringValue("MemoryCards", "Card1Path", "memcards/shared_card_1.mcd");
+  memory_card_paths[0] =
+    si.GetStringValue("MemoryCards", "Card1Path", "memcards" FS_OSPATH_SEPARATOR_STR "shared_card_1.mcd");
   memory_card_types[1] =
     ParseMemoryCardTypeName(
       si.GetStringValue("MemoryCards", "Card2Type", GetMemoryCardTypeName(DEFAULT_MEMORY_CARD_2_TYPE)).c_str())
       .value_or(DEFAULT_MEMORY_CARD_2_TYPE);
-  memory_card_paths[1] = si.GetStringValue("MemoryCards", "Card2Path", "memcards/shared_card_2.mcd");
+  memory_card_paths[1] =
+    si.GetStringValue("MemoryCards", "Card2Path", "memcards" FS_OSPATH_SEPARATOR_STR "shared_card_2.mcd");
   memory_card_use_playlist_title = si.GetBoolValue("MemoryCards", "UsePlaylistTitle", true);
 
   log_level = ParseLogLevelName(si.GetStringValue("Logging", "LogLevel", GetLogLevelName(DEFAULT_LOG_LEVEL)).c_str())
@@ -183,11 +261,25 @@ void Settings::Load(SettingsInterface& si)
   debugging.show_vram = si.GetBoolValue("Debug", "ShowVRAM");
   debugging.dump_cpu_to_vram_copies = si.GetBoolValue("Debug", "DumpCPUToVRAMCopies");
   debugging.dump_vram_to_cpu_copies = si.GetBoolValue("Debug", "DumpVRAMToCPUCopies");
+  debugging.enable_gdb_server = si.GetBoolValue("Debug", "EnableGDBServer");
+  debugging.gdb_server_port = static_cast<u16>(si.GetIntValue("Debug", "GDBServerPort"));
   debugging.show_gpu_state = si.GetBoolValue("Debug", "ShowGPUState");
   debugging.show_cdrom_state = si.GetBoolValue("Debug", "ShowCDROMState");
   debugging.show_spu_state = si.GetBoolValue("Debug", "ShowSPUState");
   debugging.show_timers_state = si.GetBoolValue("Debug", "ShowTimersState");
   debugging.show_mdec_state = si.GetBoolValue("Debug", "ShowMDECState");
+  debugging.show_dma_state = si.GetBoolValue("Debug", "ShowDMAState");
+
+  texture_replacements.enable_vram_write_replacements =
+    si.GetBoolValue("TextureReplacements", "EnableVRAMWriteReplacements", false);
+  texture_replacements.preload_textures = si.GetBoolValue("TextureReplacements", "PreloadTextures", false);
+  texture_replacements.dump_vram_writes = si.GetBoolValue("TextureReplacements", "DumpVRAMWrites", false);
+  texture_replacements.dump_vram_write_force_alpha_channel =
+    si.GetBoolValue("TextureReplacements", "DumpVRAMWriteForceAlphaChannel", true);
+  texture_replacements.dump_vram_write_width_threshold =
+    si.GetIntValue("TextureReplacements", "DumpVRAMWriteWidthThreshold", 128);
+  texture_replacements.dump_vram_write_height_threshold =
+    si.GetIntValue("TextureReplacements", "DumpVRAMWriteHeightThreshold", 128);
 }
 
 void Settings::Save(SettingsInterface& si) const
@@ -195,54 +287,92 @@ void Settings::Save(SettingsInterface& si) const
   si.SetStringValue("Console", "Region", GetConsoleRegionName(region));
 
   si.SetFloatValue("Main", "EmulationSpeed", emulation_speed);
-  si.SetBoolValue("Main", "SpeedLimiterEnabled", speed_limiter_enabled);
+  si.SetFloatValue("Main", "FastForwardSpeed", fast_forward_speed);
+  si.SetFloatValue("Main", "TurboSpeed", turbo_speed);
+  si.SetBoolValue("Main", "SyncToHostRefreshRate", sync_to_host_refresh_rate);
   si.SetBoolValue("Main", "IncreaseTimerResolution", increase_timer_resolution);
   si.SetBoolValue("Main", "StartPaused", start_paused);
   si.SetBoolValue("Main", "StartFullscreen", start_fullscreen);
+  si.SetBoolValue("Main", "PauseOnFocusLoss", pause_on_focus_loss);
   si.SetBoolValue("Main", "SaveStateOnExit", save_state_on_exit);
   si.SetBoolValue("Main", "ConfirmPowerOff", confim_power_off);
   si.SetBoolValue("Main", "LoadDevicesFromSaveStates", load_devices_from_save_states);
   si.SetBoolValue("Main", "ApplyGameSettings", apply_game_settings);
+  si.SetBoolValue("Main", "AutoLoadCheats", auto_load_cheats);
+  si.SetBoolValue("Main", "DisableAllEnhancements", disable_all_enhancements);
+  si.SetBoolValue("Main", "RewindEnable", rewind_enable);
+  si.SetFloatValue("Main", "RewindFrequency", rewind_save_frequency);
+  si.SetIntValue("Main", "RewindSaveSlots", rewind_save_slots);
+  si.SetIntValue("Main", "RunaheadFrameCount", runahead_frames);
 
   si.SetStringValue("CPU", "ExecutionMode", GetCPUExecutionModeName(cpu_execution_mode));
+  si.SetBoolValue("CPU", "OverclockEnable", cpu_overclock_enable);
+  si.SetIntValue("CPU", "OverclockNumerator", cpu_overclock_numerator);
+  si.SetIntValue("CPU", "OverclockDenominator", cpu_overclock_denominator);
   si.SetBoolValue("CPU", "RecompilerMemoryExceptions", cpu_recompiler_memory_exceptions);
+  si.SetBoolValue("CPU", "RecompilerICache", cpu_recompiler_icache);
+  si.SetStringValue("CPU", "FastmemMode", GetCPUFastmemModeName(cpu_fastmem_mode));
 
   si.SetStringValue("GPU", "Renderer", GetRendererName(gpu_renderer));
   si.SetStringValue("GPU", "Adapter", gpu_adapter.c_str());
   si.SetIntValue("GPU", "ResolutionScale", static_cast<long>(gpu_resolution_scale));
+  si.SetIntValue("GPU", "Multisamples", static_cast<long>(gpu_multisamples));
   si.SetBoolValue("GPU", "UseDebugDevice", gpu_use_debug_device);
+  si.SetBoolValue("GPU", "PerSampleShading", gpu_per_sample_shading);
+  si.SetBoolValue("GPU", "UseThread", gpu_use_thread);
+  si.SetBoolValue("GPU", "ThreadedPresentation", gpu_threaded_presentation);
   si.SetBoolValue("GPU", "TrueColor", gpu_true_color);
   si.SetBoolValue("GPU", "ScaledDithering", gpu_scaled_dithering);
-  si.SetBoolValue("GPU", "TextureFiltering", gpu_texture_filtering);
+  si.SetStringValue("GPU", "TextureFilter", GetTextureFilterName(gpu_texture_filter));
+  si.SetStringValue("GPU", "DownsampleMode", GetDownsampleModeName(gpu_downsample_mode));
   si.SetBoolValue("GPU", "DisableInterlacing", gpu_disable_interlacing);
   si.SetBoolValue("GPU", "ForceNTSCTimings", gpu_force_ntsc_timings);
   si.SetBoolValue("GPU", "WidescreenHack", gpu_widescreen_hack);
+  si.SetBoolValue("GPU", "ChromaSmoothing24Bit", gpu_24bit_chroma_smoothing);
   si.SetBoolValue("GPU", "PGXPEnable", gpu_pgxp_enable);
   si.SetBoolValue("GPU", "PGXPCulling", gpu_pgxp_culling);
   si.SetBoolValue("GPU", "PGXPTextureCorrection", gpu_pgxp_texture_correction);
   si.SetBoolValue("GPU", "PGXPVertexCache", gpu_pgxp_vertex_cache);
   si.SetBoolValue("GPU", "PGXPCPU", gpu_pgxp_cpu);
+  si.SetBoolValue("GPU", "PGXPPreserveProjFP", gpu_pgxp_preserve_proj_fp);
+  si.SetFloatValue("GPU", "PGXPTolerance", gpu_pgxp_tolerance);
+  si.SetBoolValue("GPU", "PGXPDepthBuffer", gpu_pgxp_depth_buffer);
+  si.SetFloatValue("GPU", "PGXPDepthClearThreshold", GetPGXPDepthClearThreshold());
 
   si.SetStringValue("Display", "CropMode", GetDisplayCropModeName(display_crop_mode));
   si.SetIntValue("Display", "ActiveStartOffset", display_active_start_offset);
   si.SetIntValue("Display", "ActiveEndOffset", display_active_end_offset);
+  si.SetIntValue("Display", "LineStartOffset", display_line_start_offset);
+  si.SetIntValue("Display", "LineEndOffset", display_line_end_offset);
+  si.SetBoolValue("Display", "Force4_3For24Bit", display_force_4_3_for_24bit);
   si.SetStringValue("Display", "AspectRatio", GetDisplayAspectRatioName(display_aspect_ratio));
   si.SetBoolValue("Display", "LinearFiltering", display_linear_filtering);
   si.SetBoolValue("Display", "IntegerScaling", display_integer_scaling);
+  si.SetBoolValue("Display", "PostProcessing", display_post_processing);
   si.SetBoolValue("Display", "ShowOSDMessages", display_show_osd_messages);
   si.SetBoolValue("Display", "ShowFPS", display_show_fps);
   si.SetBoolValue("Display", "ShowVPS", display_show_vps);
   si.SetBoolValue("Display", "ShowSpeed", display_show_speed);
-  si.SetBoolValue("Display", "ShowResolution", display_show_speed);
+  si.SetBoolValue("Display", "ShowResolution", display_show_resolution);
+  si.SetBoolValue("Display", "DisplayAllFrames", display_all_frames);
   si.SetBoolValue("Display", "VSync", video_sync_enabled);
+  if (display_post_process_chain.empty())
+    si.DeleteValue("Display", "PostProcessChain");
+  else
+    si.SetStringValue("Display", "PostProcessChain", display_post_process_chain.c_str());
+  si.SetFloatValue("Display", "MaxFPS", display_max_fps);
 
   si.SetBoolValue("CDROM", "ReadThread", cdrom_read_thread);
   si.SetBoolValue("CDROM", "RegionCheck", cdrom_region_check);
   si.SetBoolValue("CDROM", "LoadImageToRAM", cdrom_load_image_to_ram);
+  si.SetBoolValue("CDROM", "MuteCDAudio", cdrom_mute_cd_audio);
+  si.SetIntValue("CDROM", "ReadSpeedup", cdrom_read_speedup);
 
   si.SetStringValue("Audio", "Backend", GetAudioBackendName(audio_backend));
   si.SetIntValue("Audio", "OutputVolume", audio_output_volume);
+  si.SetIntValue("Audio", "FastForwardVolume", audio_fast_forward_volume);
   si.SetIntValue("Audio", "BufferSize", audio_buffer_size);
+  si.SetBoolValue("Audio", "Resampling", audio_resampling);
   si.SetBoolValue("Audio", "OutputMuted", audio_output_muted);
   si.SetBoolValue("Audio", "Sync", audio_sync_enabled);
   si.SetBoolValue("Audio", "DumpOnBoot", audio_dump_on_boot);
@@ -252,7 +382,6 @@ void Settings::Save(SettingsInterface& si) const
   si.SetIntValue("Hacks", "GPUFIFOSize", gpu_fifo_size);
   si.SetIntValue("Hacks", "GPUMaxRunAhead", gpu_max_run_ahead);
 
-  si.SetStringValue("BIOS", "Path", bios_path.c_str());
   si.SetBoolValue("BIOS", "PatchTTYEnable", bios_patch_tty_enable);
   si.SetBoolValue("BIOS", "PatchFastBoot", bios_patch_fast_boot);
 
@@ -287,14 +416,26 @@ void Settings::Save(SettingsInterface& si) const
   si.SetBoolValue("Debug", "ShowSPUState", debugging.show_spu_state);
   si.SetBoolValue("Debug", "ShowTimersState", debugging.show_timers_state);
   si.SetBoolValue("Debug", "ShowMDECState", debugging.show_mdec_state);
+  si.SetBoolValue("Debug", "ShowDMAState", debugging.show_dma_state);
+
+  si.SetBoolValue("TextureReplacements", "EnableVRAMWriteReplacements",
+                  texture_replacements.enable_vram_write_replacements);
+  si.SetBoolValue("TextureReplacements", "PreloadTextures", texture_replacements.preload_textures);
+  si.SetBoolValue("TextureReplacements", "DumpVRAMWrites", texture_replacements.dump_vram_writes);
+  si.SetBoolValue("TextureReplacements", "DumpVRAMWriteForceAlphaChannel",
+                  texture_replacements.dump_vram_write_force_alpha_channel);
+  si.SetIntValue("TextureReplacements", "DumpVRAMWriteWidthThreshold",
+                 texture_replacements.dump_vram_write_width_threshold);
+  si.SetIntValue("TextureReplacements", "DumpVRAMWriteHeightThreshold",
+                 texture_replacements.dump_vram_write_height_threshold);
 }
 
 static std::array<const char*, LOGLEVEL_COUNT> s_log_level_names = {
-  {"None", "Error", "Warning", "Perf", "Success", "Info", "Dev", "Profile", "Debug", "Trace"}};
+  {"None", "Error", "Warning", "Perf", "Info", "Verbose", "Dev", "Profile", "Debug", "Trace"}};
 static std::array<const char*, LOGLEVEL_COUNT> s_log_level_display_names = {
   {TRANSLATABLE("LogLevel", "None"), TRANSLATABLE("LogLevel", "Error"), TRANSLATABLE("LogLevel", "Warning"),
-   TRANSLATABLE("LogLevel", "Performance"), TRANSLATABLE("LogLevel", "Success"),
-   TRANSLATABLE("LogLevel", "Information"), TRANSLATABLE("LogLevel", "Developer"), TRANSLATABLE("LogLevel", "Profile"),
+   TRANSLATABLE("LogLevel", "Performance"), TRANSLATABLE("LogLevel", "Information"),
+   TRANSLATABLE("LogLevel", "Verbose"), TRANSLATABLE("LogLevel", "Developer"), TRANSLATABLE("LogLevel", "Profile"),
    TRANSLATABLE("LogLevel", "Debug"), TRANSLATABLE("LogLevel", "Trace")}};
 
 std::optional<LOGLEVEL> Settings::ParseLogLevelName(const char* str)
@@ -324,7 +465,7 @@ const char* Settings::GetLogLevelDisplayName(LOGLEVEL level)
 static std::array<const char*, 4> s_console_region_names = {{"Auto", "NTSC-J", "NTSC-U", "PAL"}};
 static std::array<const char*, 4> s_console_region_display_names = {
   {TRANSLATABLE("ConsoleRegion", "Auto-Detect"), TRANSLATABLE("ConsoleRegion", "NTSC-J (Japan)"),
-   TRANSLATABLE("ConsoleRegion", "NTSC-U (US)"), TRANSLATABLE("ConsoleRegion", "PAL (Europe, Australia)")}};
+   TRANSLATABLE("ConsoleRegion", "NTSC-U/C (US, Canada)"), TRANSLATABLE("ConsoleRegion", "PAL (Europe, Australia)")}};
 
 std::optional<ConsoleRegion> Settings::ParseConsoleRegionName(const char* str)
 {
@@ -352,7 +493,7 @@ const char* Settings::GetConsoleRegionDisplayName(ConsoleRegion region)
 
 static std::array<const char*, 4> s_disc_region_names = {{"NTSC-J", "NTSC-U", "PAL", "Other"}};
 static std::array<const char*, 4> s_disc_region_display_names = {
-  {TRANSLATABLE("DiscRegion", "NTSC-J (Japan)"), TRANSLATABLE("DiscRegion", "NTSC-U (US)"),
+  {TRANSLATABLE("DiscRegion", "NTSC-J (Japan)"), TRANSLATABLE("DiscRegion", "NTSC-U/C (US, Canada)"),
    TRANSLATABLE("DiscRegion", "PAL (Europe, Australia)"), TRANSLATABLE("DiscRegion", "Other")}};
 
 std::optional<DiscRegion> Settings::ParseDiscRegionName(const char* str)
@@ -409,6 +550,37 @@ const char* Settings::GetCPUExecutionModeDisplayName(CPUExecutionMode mode)
   return s_cpu_execution_mode_display_names[static_cast<u8>(mode)];
 }
 
+static std::array<const char*, static_cast<u32>(CPUFastmemMode::Count)> s_cpu_fastmem_mode_names = {
+  {"Disabled", "MMap", "LUT"}};
+static std::array<const char*, static_cast<u32>(CPUFastmemMode::Count)> s_cpu_fastmem_mode_display_names = {
+  {TRANSLATABLE("CPUFastmemMode", "Disabled (Slowest)"),
+   TRANSLATABLE("CPUFastmemMode", "MMap (Hardware, Fastest, 64-Bit Only)"),
+   TRANSLATABLE("CPUFastmemMode", "LUT (Faster)")}};
+
+std::optional<CPUFastmemMode> Settings::ParseCPUFastmemMode(const char* str)
+{
+  u8 index = 0;
+  for (const char* name : s_cpu_fastmem_mode_names)
+  {
+    if (StringUtil::Strcasecmp(name, str) == 0)
+      return static_cast<CPUFastmemMode>(index);
+
+    index++;
+  }
+
+  return std::nullopt;
+}
+
+const char* Settings::GetCPUFastmemModeName(CPUFastmemMode mode)
+{
+  return s_cpu_fastmem_mode_names[static_cast<u8>(mode)];
+}
+
+const char* Settings::GetCPUFastmemModeDisplayName(CPUFastmemMode mode)
+{
+  return s_cpu_fastmem_mode_display_names[static_cast<u8>(mode)];
+}
+
 static constexpr auto s_gpu_renderer_names = make_array(
 #ifdef WIN32
   "D3D11",
@@ -445,6 +617,67 @@ const char* Settings::GetRendererDisplayName(GPURenderer renderer)
   return s_gpu_renderer_display_names[static_cast<int>(renderer)];
 }
 
+static constexpr auto s_texture_filter_names =
+  make_array("Nearest", "Bilinear", "BilinearBinAlpha", "JINC2", "JINC2BinAlpha", "xBR", "xBRBinAlpha");
+static constexpr auto s_texture_filter_display_names =
+  make_array(TRANSLATABLE("GPUTextureFilter", "Nearest-Neighbor"), TRANSLATABLE("GPUTextureFilter", "Bilinear"),
+             TRANSLATABLE("GPUTextureFilter", "Bilinear (No Edge Blending)"), TRANSLATABLE("GPUTextureFilter", "JINC2"),
+             TRANSLATABLE("GPUTextureFilter", "JINC2 (No Edge Blending)"), TRANSLATABLE("GPUTextureFilter", "xBR"),
+             TRANSLATABLE("GPUTextureFilter", "xBR (No Edge Blending)"));
+
+std::optional<GPUTextureFilter> Settings::ParseTextureFilterName(const char* str)
+{
+  int index = 0;
+  for (const char* name : s_texture_filter_names)
+  {
+    if (StringUtil::Strcasecmp(name, str) == 0)
+      return static_cast<GPUTextureFilter>(index);
+
+    index++;
+  }
+
+  return std::nullopt;
+}
+
+const char* Settings::GetTextureFilterName(GPUTextureFilter filter)
+{
+  return s_texture_filter_names[static_cast<int>(filter)];
+}
+
+const char* Settings::GetTextureFilterDisplayName(GPUTextureFilter filter)
+{
+  return s_texture_filter_display_names[static_cast<int>(filter)];
+}
+
+static constexpr auto s_downsample_mode_names = make_array("Disabled", "Box", "Adaptive");
+static constexpr auto s_downsample_mode_display_names = make_array(
+  TRANSLATABLE("GPUDownsampleMode", "Disabled"), TRANSLATABLE("GPUDownsampleMode", "Box (Downsample 3D/Smooth All)"),
+  TRANSLATABLE("GPUDownsampleMode", "Adaptive (Preserve 3D/Smooth 2D)"));
+
+std::optional<GPUDownsampleMode> Settings::ParseDownsampleModeName(const char* str)
+{
+  int index = 0;
+  for (const char* name : s_downsample_mode_names)
+  {
+    if (StringUtil::Strcasecmp(name, str) == 0)
+      return static_cast<GPUDownsampleMode>(index);
+
+    index++;
+  }
+
+  return std::nullopt;
+}
+
+const char* Settings::GetDownsampleModeName(GPUDownsampleMode mode)
+{
+  return s_downsample_mode_names[static_cast<int>(mode)];
+}
+
+const char* Settings::GetDownsampleModeDisplayName(GPUDownsampleMode mode)
+{
+  return s_downsample_mode_display_names[static_cast<int>(mode)];
+}
+
 static std::array<const char*, 3> s_display_crop_mode_names = {{"None", "Overscan", "Borders"}};
 static std::array<const char*, 3> s_display_crop_mode_display_names = {
   {TRANSLATABLE("DisplayCropMode", "None"), TRANSLATABLE("DisplayCropMode", "Only Overscan Area"),
@@ -474,10 +707,12 @@ const char* Settings::GetDisplayCropModeDisplayName(DisplayCropMode crop_mode)
   return s_display_crop_mode_display_names[static_cast<int>(crop_mode)];
 }
 
-static std::array<const char*, 6> s_display_aspect_ratio_names = {
-  {"4:3", "16:9", "8:7", "2:1 (VRAM 1:1)", "1:1", "PAR 1:1"}};
-static constexpr std::array<float, 6> s_display_aspect_ratio_values = {
-  {4.0f / 3.0f, 16.0f / 9.0f, 8.0f / 7.0f, 2.0f / 1.0f, 1.0f, -1.0f}};
+static std::array<const char*, 14> s_display_aspect_ratio_names = {
+  {TRANSLATABLE("DisplayAspectRatio", "Auto (Game Native)"), "4:3", "16:9", "16:10", "19:9", "20:9", "21:9", "32:9",
+   "8:7", "5:4", "3:2", "2:1 (VRAM 1:1)", "1:1", "PAR 1:1"}};
+static constexpr std::array<float, 14> s_display_aspect_ratio_values = {
+  {-1.0f, 4.0f / 3.0f, 16.0f / 9.0f, 16.0f / 10.0f, 19.0f / 9.0f, 20.0f / 9.0f, 64.0f / 27.0f, 32.0f / 9.0f,
+   8.0f / 7.0f, 5.0f / 4.0f, 3.0f / 2.0f, 2.0f / 1.0f, 1.0f, -1.0f}};
 
 std::optional<DisplayAspectRatio> Settings::ParseDisplayAspectRatio(const char* str)
 {
@@ -503,10 +738,24 @@ float Settings::GetDisplayAspectRatioValue(DisplayAspectRatio ar)
   return s_display_aspect_ratio_values[static_cast<int>(ar)];
 }
 
-static std::array<const char*, 3> s_audio_backend_names = {{"Null", "Cubeb", "SDL"}};
-static std::array<const char*, 3> s_audio_backend_display_names = {{TRANSLATABLE("AudioBackend", "Null (No Output)"),
-                                                                    TRANSLATABLE("AudioBackend", "Cubeb"),
-                                                                    TRANSLATABLE("AudioBackend", "SDL")}};
+static std::array<const char*, 3> s_audio_backend_names = {{
+  "Null",
+  "Cubeb",
+#ifndef ANDROID
+  "SDL",
+#else
+  "OpenSLES",
+#endif
+}};
+static std::array<const char*, 3> s_audio_backend_display_names = {{
+  TRANSLATABLE("AudioBackend", "Null (No Output)"),
+  TRANSLATABLE("AudioBackend", "Cubeb"),
+#ifndef ANDROID
+  TRANSLATABLE("AudioBackend", "SDL"),
+#else
+  TRANSLATABLE("AudioBackend", "OpenSL ES"),
+#endif
+}};
 
 std::optional<AudioBackend> Settings::ParseAudioBackend(const char* str)
 {
@@ -532,12 +781,13 @@ const char* Settings::GetAudioBackendDisplayName(AudioBackend backend)
   return s_audio_backend_display_names[static_cast<int>(backend)];
 }
 
-static std::array<const char*, 6> s_controller_type_names = {
-  {"None", "DigitalController", "AnalogController", "NamcoGunCon", "PlayStationMouse", "NeGcon"}};
-static std::array<const char*, 6> s_controller_display_names = {
+static std::array<const char*, 7> s_controller_type_names = {
+  {"None", "DigitalController", "AnalogController", "AnalogJoystick", "NamcoGunCon", "PlayStationMouse", "NeGcon"}};
+static std::array<const char*, 7> s_controller_display_names = {
   {TRANSLATABLE("ControllerType", "None"), TRANSLATABLE("ControllerType", "Digital Controller"),
-   TRANSLATABLE("ControllerType", "Analog Controller (DualShock)"), TRANSLATABLE("ControllerType", "Namco GunCon"),
-   TRANSLATABLE("ControllerType", "PlayStation Mouse"), TRANSLATABLE("ControllerType", "NeGcon")}};
+   TRANSLATABLE("ControllerType", "Analog Controller (DualShock)"), TRANSLATABLE("ControllerType", "Analog Joystick"),
+   TRANSLATABLE("ControllerType", "Namco GunCon"), TRANSLATABLE("ControllerType", "PlayStation Mouse"),
+   TRANSLATABLE("ControllerType", "NeGcon")}};
 
 std::optional<ControllerType> Settings::ParseControllerTypeName(const char* str)
 {

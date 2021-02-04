@@ -39,6 +39,8 @@ Context::Context(VkInstance instance, VkPhysicalDevice physical_device, bool own
 
 Context::~Context()
 {
+  StopPresentThread();
+
   if (m_device != VK_NULL_HANDLE)
     WaitForGPUIdle();
 
@@ -91,7 +93,7 @@ bool Context::CheckValidationLayerAvailablility()
                          return strcmp(it.extensionName, VK_EXT_DEBUG_REPORT_EXTENSION_NAME) == 0;
                        }) != extension_list.end() &&
           std::find_if(layer_list.begin(), layer_list.end(), [](const auto& it) {
-            return strcmp(it.layerName, "VK_LAYER_LUNARG_standard_validation") == 0;
+            return strcmp(it.layerName, "VK_LAYER_KHRONOS_validation") == 0;
           }) != layer_list.end());
 }
 
@@ -123,7 +125,7 @@ VkInstance Context::CreateVulkanInstance(bool enable_surface, bool enable_debug_
   // Enable debug layer on debug builds
   if (enable_validation_layer)
   {
-    static const char* layer_names[] = {"VK_LAYER_LUNARG_standard_validation"};
+    static const char* layer_names[] = {"VK_LAYER_KHRONOS_validation"};
     instance_create_info.enabledLayerCount = 1;
     instance_create_info.ppEnabledLayerNames = layer_names;
   }
@@ -186,19 +188,24 @@ bool Context::SelectInstanceExtensions(ExtensionList* extension_list, bool enabl
 #if defined(VK_USE_PLATFORM_WIN32_KHR)
   if (enable_surface && !SupportsExtension(VK_KHR_WIN32_SURFACE_EXTENSION_NAME, true))
     return false;
-#elif defined(VK_USE_PLATFORM_XLIB_KHR)
+#endif
+#if defined(VK_USE_PLATFORM_XLIB_KHR)
   if (enable_surface && !SupportsExtension(VK_KHR_XLIB_SURFACE_EXTENSION_NAME, true))
     return false;
-#elif defined(VK_USE_PLATFORM_XCB_KHR)
-  if (enable_surface && !SupportsExtension(VK_KHR_XCB_SURFACE_EXTENSION_NAME, true))
+#endif
+#if defined(VK_USE_PLATFORM_WAYLAND_KHR)
+  if (enable_surface && !SupportsExtension(VK_KHR_WAYLAND_SURFACE_EXTENSION_NAME, true))
     return false;
-#elif defined(VK_USE_PLATFORM_ANDROID_KHR)
+#endif
+#if defined(VK_USE_PLATFORM_ANDROID_KHR)
   if (enable_surface && !SupportsExtension(VK_KHR_ANDROID_SURFACE_EXTENSION_NAME, true))
     return false;
-#elif defined(VK_USE_PLATFORM_MACOS_MVK)
+#endif
+#if defined(VK_USE_PLATFORM_MACOS_MVK)
   if (enable_surface && !SupportsExtension(VK_MVK_MACOS_SURFACE_EXTENSION_NAME, true))
     return false;
-#elif defined(VK_USE_PLATFORM_METAL_EXT)
+#endif
+#if defined(VK_USE_PLATFORM_METAL_EXT)
   if (enable_surface && !SupportsExtension(VK_EXT_METAL_SURFACE_EXTENSION_NAME, true))
     return false;
 #endif
@@ -284,7 +291,7 @@ Context::GPUNameList Context::EnumerateGPUNames(VkInstance instance)
 }
 
 bool Context::Create(std::string_view gpu_name, const WindowInfo* wi, std::unique_ptr<SwapChain>* out_swap_chain,
-                     bool enable_debug_reports, bool enable_validation_layer)
+                     bool threaded_presentation, bool enable_debug_reports, bool enable_validation_layer)
 {
   AssertMsg(!g_vulkan_context, "Has no current context");
 
@@ -368,6 +375,9 @@ bool Context::Create(std::string_view gpu_name, const WindowInfo* wi, std::uniqu
     g_vulkan_context.reset();
     return false;
   }
+
+  if (threaded_presentation)
+    g_vulkan_context->StartPresentThread();
 
   return true;
 }
@@ -467,6 +477,7 @@ bool Context::SelectDeviceFeatures(const VkPhysicalDeviceFeatures* required_feat
 
   // Enable the features we use.
   m_device_features.dualSrcBlend = available_features.dualSrcBlend;
+  m_device_features.sampleRateShading = available_features.sampleRateShading;
   return true;
 }
 
@@ -804,6 +815,7 @@ void Context::WaitForFenceCounter(u64 fence_counter)
 
 void Context::WaitForGPUIdle()
 {
+  WaitForPresentComplete();
   vkDeviceWaitIdle(m_device);
 }
 
@@ -837,8 +849,10 @@ void Context::WaitForCommandBufferCompletion(u32 index)
   m_completed_fence_counter = now_completed_counter;
 }
 
-void Context::SubmitCommandBuffer(VkSemaphore wait_semaphore, VkSemaphore signal_semaphore,
-                                  VkSwapchainKHR present_swap_chain, uint32_t present_image_index)
+void Context::SubmitCommandBuffer(VkSemaphore wait_semaphore /* = VK_NULL_HANDLE */,
+                                  VkSemaphore signal_semaphore /* = VK_NULL_HANDLE */,
+                                  VkSwapchainKHR present_swap_chain /* = VK_NULL_HANDLE */,
+                                  uint32_t present_image_index /* = 0xFFFFFFFF */, bool submit_on_thread /* = false */)
 {
   FrameResources& resources = m_frame_resources[m_current_frame];
 
@@ -853,7 +867,30 @@ void Context::SubmitCommandBuffer(VkSemaphore wait_semaphore, VkSemaphore signal
   // This command buffer now has commands, so can't be re-used without waiting.
   resources.needs_fence_wait = true;
 
-  // This may be executed on the worker thread, so don't modify any state of the manager class.
+  std::unique_lock<std::mutex> lock(m_present_mutex);
+  WaitForPresentComplete(lock);
+
+  if (!submit_on_thread || !m_present_thread.joinable())
+  {
+    DoSubmitCommandBuffer(m_current_frame, wait_semaphore, signal_semaphore);
+    if (present_swap_chain != VK_NULL_HANDLE)
+      DoPresent(signal_semaphore, present_swap_chain, present_image_index);
+    return;
+  }
+
+  m_queued_present.command_buffer_index = m_current_frame;
+  m_queued_present.present_swap_chain = present_swap_chain;
+  m_queued_present.present_image_index = present_image_index;
+  m_queued_present.wait_semaphore = wait_semaphore;
+  m_queued_present.signal_semaphore = signal_semaphore;
+  m_present_done.store(false);
+  m_present_queued_cv.notify_one();
+}
+
+void Context::DoSubmitCommandBuffer(u32 index, VkSemaphore wait_semaphore, VkSemaphore signal_semaphore)
+{
+  FrameResources& resources = m_frame_resources[index];
+
   uint32_t wait_bits = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
   VkSubmitInfo submit_info = {VK_STRUCTURE_TYPE_SUBMIT_INFO, nullptr, 0,      nullptr, &wait_bits, 1u,
                               &resources.command_buffer,     0,       nullptr};
@@ -870,37 +907,94 @@ void Context::SubmitCommandBuffer(VkSemaphore wait_semaphore, VkSemaphore signal
     submit_info.pSignalSemaphores = &signal_semaphore;
   }
 
-  res = vkQueueSubmit(m_graphics_queue, 1, &submit_info, resources.fence);
+  VkResult res = vkQueueSubmit(m_graphics_queue, 1, &submit_info, resources.fence);
   if (res != VK_SUCCESS)
   {
     LOG_VULKAN_ERROR(res, "vkQueueSubmit failed: ");
     Panic("Failed to submit command buffer.");
   }
+}
 
-  // Do we have a swap chain to present?
-  if (present_swap_chain != VK_NULL_HANDLE)
+void Context::DoPresent(VkSemaphore wait_semaphore, VkSwapchainKHR present_swap_chain, uint32_t present_image_index)
+{
+  // Should have a signal semaphore.
+  Assert(wait_semaphore != VK_NULL_HANDLE);
+  VkPresentInfoKHR present_info = {VK_STRUCTURE_TYPE_PRESENT_INFO_KHR,
+                                   nullptr,
+                                   1,
+                                   &wait_semaphore,
+                                   1,
+                                   &present_swap_chain,
+                                   &present_image_index,
+                                   nullptr};
+
+  VkResult res = vkQueuePresentKHR(m_present_queue, &present_info);
+  if (res != VK_SUCCESS)
   {
-    // Should have a signal semaphore.
-    Assert(signal_semaphore != VK_NULL_HANDLE);
-    VkPresentInfoKHR present_info = {VK_STRUCTURE_TYPE_PRESENT_INFO_KHR,
-                                     nullptr,
-                                     1,
-                                     &signal_semaphore,
-                                     1,
-                                     &present_swap_chain,
-                                     &present_image_index,
-                                     nullptr};
+    // VK_ERROR_OUT_OF_DATE_KHR is not fatal, just means we need to recreate our swap chain.
+    if (res != VK_ERROR_OUT_OF_DATE_KHR && res != VK_SUBOPTIMAL_KHR)
+      LOG_VULKAN_ERROR(res, "vkQueuePresentKHR failed: ");
 
-    res = vkQueuePresentKHR(m_present_queue, &present_info);
-    if (res != VK_SUCCESS)
-    {
-      // VK_ERROR_OUT_OF_DATE_KHR is not fatal, just means we need to recreate our swap chain.
-      if (res != VK_ERROR_OUT_OF_DATE_KHR && res != VK_SUBOPTIMAL_KHR)
-        LOG_VULKAN_ERROR(res, "vkQueuePresentKHR failed: ");
-
-      m_last_present_failed = true;
-    }
+    m_last_present_failed.store(true);
   }
+}
+
+void Context::WaitForPresentComplete()
+{
+  if (m_present_done.load())
+    return;
+
+  std::unique_lock<std::mutex> lock(m_present_mutex);
+  WaitForPresentComplete(lock);
+}
+
+void Context::WaitForPresentComplete(std::unique_lock<std::mutex>& lock)
+{
+  if (m_present_done.load())
+    return;
+
+  m_present_done_cv.wait(lock, [this]() { return m_present_done.load(); });
+}
+
+void Context::PresentThread()
+{
+  std::unique_lock<std::mutex> lock(m_present_mutex);
+  while (!m_present_thread_done.load())
+  {
+    m_present_queued_cv.wait(lock, [this]() { return !m_present_done.load() || m_present_thread_done.load(); });
+
+    if (m_present_done.load())
+      continue;
+
+    DoSubmitCommandBuffer(m_queued_present.command_buffer_index, m_queued_present.wait_semaphore,
+                          m_queued_present.signal_semaphore);
+    DoPresent(m_queued_present.signal_semaphore, m_queued_present.present_swap_chain,
+              m_queued_present.present_image_index);
+    m_present_done.store(true);
+    m_present_done_cv.notify_one();
+  }
+}
+
+void Context::StartPresentThread()
+{
+  Assert(!m_present_thread.joinable());
+  m_present_thread_done.store(false);
+  m_present_thread = std::thread(&Context::PresentThread, this);
+}
+
+void Context::StopPresentThread()
+{
+  if (!m_present_thread.joinable())
+    return;
+
+  {
+    std::unique_lock<std::mutex> lock(m_present_mutex);
+    WaitForPresentComplete(lock);
+    m_present_thread_done.store(true);
+    m_present_queued_cv.notify_one();
+  }
+
+  m_present_thread.join();
 }
 
 void Context::MoveToNextCommandBuffer()
@@ -911,6 +1005,9 @@ void Context::MoveToNextCommandBuffer()
 void Context::ActivateCommandBuffer(u32 index)
 {
   FrameResources& resources = m_frame_resources[index];
+
+  if (!m_present_done.load() && m_queued_present.command_buffer_index == index)
+    WaitForPresentComplete();
 
   // Wait for the GPU to finish with all resources for this command buffer.
   if (resources.fence_counter > m_completed_fence_counter)
@@ -995,6 +1092,12 @@ void Context::DeferImageViewDestruction(VkImageView object)
 {
   FrameResources& resources = m_frame_resources[m_current_frame];
   resources.cleanup_resources.push_back([this, object]() { vkDestroyImageView(m_device, object, nullptr); });
+}
+
+void Context::DeferPipelineDestruction(VkPipeline pipeline)
+{
+  FrameResources& resources = m_frame_resources[m_current_frame];
+  resources.cleanup_resources.push_back([this, pipeline]() { vkDestroyPipeline(m_device, pipeline, nullptr); });
 }
 
 static VKAPI_ATTR VkBool32 VKAPI_CALL DebugReportCallback(VkDebugReportFlagsEXT flags,

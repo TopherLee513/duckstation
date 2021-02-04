@@ -9,7 +9,9 @@ namespace BIOS {
 enum : u32
 {
   BIOS_BASE = 0x1FC00000,
-  BIOS_SIZE = 0x80000
+  BIOS_SIZE = 0x80000,
+  BIOS_SIZE_PS2 = 0x400000,
+  BIOS_SIZE_PS3 = 0x3E66F0
 };
 
 using Image = std::vector<u8>;
@@ -22,6 +24,14 @@ struct Hash
   ALWAYS_INLINE bool operator!=(const Hash& bh) const { return (std::memcmp(bytes, bh.bytes, sizeof(bytes)) != 0); }
 
   std::string ToString() const;
+};
+
+struct ImageInfo
+{
+  const char* description;
+  ConsoleRegion region;
+  Hash hash;
+  bool patch_compatible;
 };
 
 #pragma pack(push, 1)
@@ -46,16 +56,18 @@ static_assert(sizeof(PSEXEHeader) == 0x800);
 #pragma pack(pop)
 
 Hash GetHash(const Image& image);
-std::optional<Image> LoadImageFromFile(std::string_view filename);
-std::optional<Hash> GetHashForFile(std::string_view filename);
+std::optional<Image> LoadImageFromFile(const char* filename);
+std::optional<Hash> GetHashForFile(const char* filename);
 
+const ImageInfo* GetImageInfoForHash(const Hash& hash);
 bool IsValidHashForRegion(ConsoleRegion region, const Hash& hash);
 
-void PatchBIOS(Image& image, u32 address, u32 value, u32 mask = UINT32_C(0xFFFFFFFF));
+void PatchBIOS(u8* image, u32 image_size, u32 address, u32 value, u32 mask = UINT32_C(0xFFFFFFFF));
 
-bool PatchBIOSEnableTTY(Image& image, const Hash& hash);
-bool PatchBIOSFastBoot(Image& image, const Hash& hash);
-bool PatchBIOSForEXE(Image& image, u32 r_pc, u32 r_gp, u32 r_sp, u32 r_fp);
+bool PatchBIOSEnableTTY(u8* image, u32 image_size, const Hash& hash);
+bool PatchBIOSFastBoot(u8* image, u32 image_size, const Hash& hash);
+bool PatchBIOSForEXE(u8* image, u32 image_size, u32 r_pc, u32 r_gp, u32 r_sp, u32 r_fp);
 
 bool IsValidPSExeHeader(const PSEXEHeader& header, u32 file_size);
+DiscRegion GetPSExeDiscRegion(const PSEXEHeader& header);
 } // namespace BIOS

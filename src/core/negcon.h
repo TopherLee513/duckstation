@@ -39,13 +39,14 @@ public:
   static AxisList StaticGetAxisNames();
   static ButtonList StaticGetButtonNames();
   static u32 StaticGetVibrationMotorCount();
+  static SettingList StaticGetSettings();
 
   ControllerType GetType() const override;
   std::optional<s32> GetAxisCodeByName(std::string_view axis_name) const override;
   std::optional<s32> GetButtonCodeByName(std::string_view button_name) const override;
 
   void Reset() override;
-  bool DoState(StateWrapper& sw) override;
+  bool DoState(StateWrapper& sw, bool apply_input_state) override;
 
   void SetAxisState(s32 axis_code, float value) override;
   void SetButtonState(s32 button_code, bool pressed) override;
@@ -55,6 +56,11 @@ public:
 
   void SetAxisState(Axis axis, u8 value);
   void SetButtonState(Button button, bool pressed);
+
+  u32 GetButtonStateBits() const override;
+  std::optional<u32> GetAnalogInputBytes() const override;
+
+  void LoadSettings(const char* section) override;
 
 private:
   enum class TransferState : u8
@@ -75,4 +81,6 @@ private:
   u16 m_button_state = UINT16_C(0xFFFF);
 
   TransferState m_transfer_state = TransferState::Idle;
+
+  float m_steering_deadzone = 0.00f;
 };

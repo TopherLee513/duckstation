@@ -1,16 +1,21 @@
 #include "gamepropertiesdialog.h"
 #include "common/cd_image.h"
 #include "common/cd_image_hasher.h"
-#include "core/game_list.h"
 #include "core/settings.h"
+#include "core/system.h"
+#include "frontend-common/game_list.h"
 #include "qthostinterface.h"
 #include "qtprogresscallback.h"
 #include "qtutils.h"
 #include "scmversion/scmversion.h"
 #include <QtGui/QClipboard>
 #include <QtGui/QGuiApplication>
+#include <QtWidgets/QFileDialog>
 #include <QtWidgets/QInputDialog>
 #include <QtWidgets/QMessageBox>
+
+static constexpr char MEMORY_CARD_IMAGE_FILTER[] =
+  QT_TRANSLATE_NOOP("MemoryCardSettingsWidget", "All Memory Card Types (*.mcd *.mcr *.mc)");
 
 GamePropertiesDialog::GamePropertiesDialog(QtHostInterface* host_interface, QWidget* parent /* = nullptr */)
   : QDialog(parent), m_host_interface(host_interface)
@@ -117,7 +122,7 @@ void GamePropertiesDialog::setupAdditionalUi()
   for (u32 i = 0; i < static_cast<u32>(DisplayAspectRatio::Count); i++)
   {
     m_ui.userAspectRatio->addItem(
-      QString::fromUtf8(Settings::GetDisplayAspectRatioName(static_cast<DisplayAspectRatio>(i))));
+      qApp->translate("DisplayAspectRatio", Settings::GetDisplayAspectRatioName(static_cast<DisplayAspectRatio>(i))));
   }
 
   m_ui.userCropMode->addItem(tr("(unchanged)"));
@@ -127,18 +132,53 @@ void GamePropertiesDialog::setupAdditionalUi()
       qApp->translate("DisplayCropMode", Settings::GetDisplayCropModeDisplayName(static_cast<DisplayCropMode>(i))));
   }
 
+  m_ui.userDownsampleMode->addItem(tr("(unchanged)"));
+  for (u32 i = 0; i < static_cast<u32>(GPUDownsampleMode::Count); i++)
+  {
+    m_ui.userDownsampleMode->addItem(
+      qApp->translate("GPUDownsampleMode", Settings::GetDownsampleModeDisplayName(static_cast<GPUDownsampleMode>(i))));
+  }
+
+  m_ui.userResolutionScale->addItem(tr("(unchanged)"));
+  QtUtils::FillComboBoxWithResolutionScales(m_ui.userResolutionScale);
+
+  m_ui.userMSAAMode->addItem(tr("(unchanged)"));
+  QtUtils::FillComboBoxWithMSAAModes(m_ui.userMSAAMode);
+
+  m_ui.userTextureFiltering->addItem(tr("(unchanged)"));
+  for (u32 i = 0; i < static_cast<u32>(GPUTextureFilter::Count); i++)
+  {
+    m_ui.userTextureFiltering->addItem(
+      qApp->translate("GPUTextureFilter", Settings::GetTextureFilterDisplayName(static_cast<GPUTextureFilter>(i))));
+  }
+
   m_ui.userControllerType1->addItem(tr("(unchanged)"));
   for (u32 i = 0; i < static_cast<u32>(ControllerType::Count); i++)
   {
     m_ui.userControllerType1->addItem(
       qApp->translate("ControllerType", Settings::GetControllerTypeDisplayName(static_cast<ControllerType>(i))));
   }
-
   m_ui.userControllerType2->addItem(tr("(unchanged)"));
   for (u32 i = 0; i < static_cast<u32>(ControllerType::Count); i++)
   {
     m_ui.userControllerType2->addItem(
       qApp->translate("ControllerType", Settings::GetControllerTypeDisplayName(static_cast<ControllerType>(i))));
+  }
+  m_ui.userInputProfile->addItem(tr("(unchanged)"));
+  for (const auto& it : m_host_interface->getInputProfileList())
+    m_ui.userInputProfile->addItem(QString::fromStdString(it.name));
+
+  m_ui.userMemoryCard1Type->addItem(tr("(unchanged)"));
+  for (u32 i = 0; i < static_cast<u32>(MemoryCardType::Count); i++)
+  {
+    m_ui.userMemoryCard1Type->addItem(
+      qApp->translate("MemoryCardType", Settings::GetMemoryCardTypeDisplayName(static_cast<MemoryCardType>(i))));
+  }
+  m_ui.userMemoryCard2Type->addItem(tr("(unchanged)"));
+  for (u32 i = 0; i < static_cast<u32>(MemoryCardType::Count); i++)
+  {
+    m_ui.userMemoryCard2Type->addItem(
+      qApp->translate("MemoryCardType", Settings::GetMemoryCardTypeDisplayName(static_cast<MemoryCardType>(i))));
   }
 
   QGridLayout* traits_layout = new QGridLayout(m_ui.compatibilityTraits);
@@ -153,9 +193,9 @@ void GamePropertiesDialog::setupAdditionalUi()
   setWindowFlags(windowFlags() & ~Qt::WindowContextHelpButtonHint);
 }
 
-void GamePropertiesDialog::showForEntry(QtHostInterface* host_interface, const GameListEntry* ge)
+void GamePropertiesDialog::showForEntry(QtHostInterface* host_interface, const GameListEntry* ge, QWidget* parent)
 {
-  GamePropertiesDialog* gpd = new GamePropertiesDialog(host_interface);
+  GamePropertiesDialog* gpd = new GamePropertiesDialog(host_interface, parent);
   gpd->populate(ge);
   gpd->show();
   gpd->onResize();
@@ -198,6 +238,26 @@ void GamePropertiesDialog::populateTracksInfo(const std::string& image_path)
   }
 }
 
+void GamePropertiesDialog::populateBooleanUserSetting(QCheckBox* cb, const std::optional<bool>& value)
+{
+  QSignalBlocker sb(cb);
+  if (value.has_value())
+    cb->setCheckState(value.value() ? Qt::Checked : Qt::Unchecked);
+  else
+    cb->setCheckState(Qt::PartiallyChecked);
+}
+
+void GamePropertiesDialog::connectBooleanUserSetting(QCheckBox* cb, std::optional<bool>* value)
+{
+  connect(cb, &QCheckBox::stateChanged, [this, value](int state) {
+    if (state == Qt::PartiallyChecked)
+      value->reset();
+    else
+      *value = (state == Qt::Checked);
+    saveGameSettings();
+  });
+}
+
 void GamePropertiesDialog::populateGameSettings()
 {
   const GameSettings::Entry& gs = m_game_settings;
@@ -206,6 +266,30 @@ void GamePropertiesDialog::populateGameSettings()
   {
     QSignalBlocker sb(m_trait_checkboxes[i]);
     m_trait_checkboxes[i]->setChecked(gs.HasTrait(static_cast<GameSettings::Trait>(i)));
+  }
+
+  if (gs.runahead_frames.has_value())
+  {
+    QSignalBlocker sb(m_ui.userRunaheadFrames);
+    m_ui.userRunaheadFrames->setCurrentIndex(static_cast<int>(gs.runahead_frames.value()));
+  }
+
+  if (gs.cpu_overclock_numerator.has_value() || gs.cpu_overclock_denominator.has_value())
+  {
+    const u32 numerator = gs.cpu_overclock_numerator.value_or(1);
+    const u32 denominator = gs.cpu_overclock_denominator.value_or(1);
+    const u32 percent = Settings::CPUOverclockFractionToPercent(numerator, denominator);
+    QSignalBlocker sb(m_ui.userCPUClockSpeed);
+    m_ui.userCPUClockSpeed->setValue(static_cast<int>(percent));
+  }
+
+  populateBooleanUserSetting(m_ui.userEnableCPUClockSpeedControl, gs.cpu_overclock_enable);
+  updateCPUClockSpeedLabel();
+
+  if (gs.cdrom_read_speedup.has_value())
+  {
+    QSignalBlocker sb(m_ui.userCDROMReadSpeedup);
+    m_ui.userCDROMReadSpeedup->setCurrentIndex(static_cast<int>(gs.cdrom_read_speedup.value()));
   }
 
   if (gs.display_active_start_offset.has_value())
@@ -218,6 +302,47 @@ void GamePropertiesDialog::populateGameSettings()
     QSignalBlocker sb(m_ui.displayActiveEndOffset);
     m_ui.displayActiveEndOffset->setValue(static_cast<int>(gs.display_active_end_offset.value()));
   }
+  if (gs.display_line_start_offset.has_value())
+  {
+    QSignalBlocker sb(m_ui.displayLineStartOffset);
+    m_ui.displayLineStartOffset->setValue(static_cast<int>(gs.display_line_start_offset.value()));
+  }
+  if (gs.display_line_end_offset.has_value())
+  {
+    QSignalBlocker sb(m_ui.displayLineEndOffset);
+    m_ui.displayLineEndOffset->setValue(static_cast<int>(gs.display_line_end_offset.value()));
+  }
+
+  if (gs.dma_max_slice_ticks.has_value())
+  {
+    QSignalBlocker sb(m_ui.dmaMaxSliceTicks);
+    m_ui.dmaMaxSliceTicks->setValue(static_cast<int>(gs.dma_max_slice_ticks.value()));
+  }
+  if (gs.dma_halt_ticks.has_value())
+  {
+    QSignalBlocker sb(m_ui.dmaHaltTicks);
+    m_ui.dmaHaltTicks->setValue(static_cast<int>(gs.dma_halt_ticks.value()));
+  }
+  if (gs.gpu_fifo_size.has_value())
+  {
+    QSignalBlocker sb(m_ui.gpuFIFOSize);
+    m_ui.gpuFIFOSize->setValue(static_cast<int>(gs.gpu_fifo_size.value()));
+  }
+  if (gs.gpu_max_run_ahead.has_value())
+  {
+    QSignalBlocker sb(m_ui.gpuMaxRunAhead);
+    m_ui.gpuMaxRunAhead->setValue(static_cast<int>(gs.gpu_max_run_ahead.value()));
+  }
+  if (gs.gpu_pgxp_tolerance.has_value())
+  {
+    QSignalBlocker sb(m_ui.gpuPGXPTolerance);
+    m_ui.gpuPGXPTolerance->setValue(static_cast<double>(gs.gpu_pgxp_tolerance.value()));
+  }
+  if (gs.gpu_pgxp_depth_threshold.has_value())
+  {
+    QSignalBlocker sb(m_ui.gpuPGXPDepthThreshold);
+    m_ui.gpuPGXPDepthThreshold->setValue(static_cast<double>(gs.gpu_pgxp_depth_threshold.value()));
+  }
 
   if (gs.display_crop_mode.has_value())
   {
@@ -229,6 +354,59 @@ void GamePropertiesDialog::populateGameSettings()
     QSignalBlocker sb(m_ui.userAspectRatio);
     m_ui.userAspectRatio->setCurrentIndex(static_cast<int>(gs.display_aspect_ratio.value()) + 1);
   }
+  if (gs.gpu_downsample_mode.has_value())
+  {
+    QSignalBlocker sb(m_ui.userDownsampleMode);
+    m_ui.userDownsampleMode->setCurrentIndex(static_cast<int>(gs.gpu_downsample_mode.value()) + 1);
+  }
+
+  populateBooleanUserSetting(m_ui.userLinearUpscaling, gs.display_linear_upscaling);
+  populateBooleanUserSetting(m_ui.userIntegerUpscaling, gs.display_integer_upscaling);
+
+  if (gs.gpu_resolution_scale.has_value())
+  {
+    QSignalBlocker sb(m_ui.userResolutionScale);
+    m_ui.userResolutionScale->setCurrentIndex(static_cast<int>(gs.gpu_resolution_scale.value()) + 1);
+  }
+  else
+  {
+    QSignalBlocker sb(m_ui.userResolutionScale);
+    m_ui.userResolutionScale->setCurrentIndex(0);
+  }
+
+  if (gs.gpu_multisamples.has_value() && gs.gpu_per_sample_shading.has_value())
+  {
+    QSignalBlocker sb(m_ui.userMSAAMode);
+    const QVariant current_msaa_mode(
+      QtUtils::GetMSAAModeValue(static_cast<uint>(gs.gpu_multisamples.value()), gs.gpu_per_sample_shading.value()));
+    const int current_msaa_index = m_ui.userMSAAMode->findData(current_msaa_mode);
+    if (current_msaa_index >= 0)
+      m_ui.userMSAAMode->setCurrentIndex((current_msaa_index >= 0) ? current_msaa_index : 0);
+  }
+  else
+  {
+    QSignalBlocker sb(m_ui.userMSAAMode);
+    m_ui.userMSAAMode->setCurrentIndex(0);
+  }
+
+  if (gs.gpu_texture_filter.has_value())
+  {
+    QSignalBlocker sb(m_ui.userTextureFiltering);
+    m_ui.userTextureFiltering->setCurrentIndex(static_cast<int>(gs.gpu_texture_filter.value()) + 1);
+  }
+  else
+  {
+    QSignalBlocker sb(m_ui.userResolutionScale);
+    m_ui.userTextureFiltering->setCurrentIndex(0);
+  }
+
+  populateBooleanUserSetting(m_ui.userTrueColor, gs.gpu_true_color);
+  populateBooleanUserSetting(m_ui.userScaledDithering, gs.gpu_scaled_dithering);
+  populateBooleanUserSetting(m_ui.userForceNTSCTimings, gs.gpu_force_ntsc_timings);
+  populateBooleanUserSetting(m_ui.userWidescreenHack, gs.gpu_widescreen_hack);
+  populateBooleanUserSetting(m_ui.userForce43For24Bit, gs.display_force_4_3_for_24bit);
+  populateBooleanUserSetting(m_ui.userPGXP, gs.gpu_pgxp);
+  populateBooleanUserSetting(m_ui.userPGXPDepthBuffer, gs.gpu_pgxp_depth_buffer);
 
   if (gs.controller_1_type.has_value())
   {
@@ -240,21 +418,44 @@ void GamePropertiesDialog::populateGameSettings()
     QSignalBlocker sb(m_ui.userControllerType2);
     m_ui.userControllerType2->setCurrentIndex(static_cast<int>(gs.controller_2_type.value()) + 1);
   }
-  if (gs.gpu_widescreen_hack.has_value())
+  if (!gs.input_profile_name.empty())
   {
-    QSignalBlocker sb(m_ui.userWidescreenHack);
-    m_ui.userWidescreenHack->setCheckState(gs.gpu_widescreen_hack.value() ? Qt::Checked : Qt::Unchecked);
+    QSignalBlocker sb(m_ui.userInputProfile);
+    int index = m_ui.userInputProfile->findText(QString::fromStdString(gs.input_profile_name));
+    if (index < 0)
+    {
+      index = m_ui.userInputProfile->count();
+      m_ui.userInputProfile->addItem(QString::fromStdString(gs.input_profile_name));
+    }
+
+    m_ui.userInputProfile->setCurrentIndex(index);
   }
-  else
+
+  if (gs.memory_card_1_type.has_value())
   {
-    QSignalBlocker sb(m_ui.userWidescreenHack);
-    m_ui.userWidescreenHack->setCheckState(Qt::PartiallyChecked);
+    QSignalBlocker sb(m_ui.userMemoryCard1Type);
+    m_ui.userMemoryCard1Type->setCurrentIndex(static_cast<int>(gs.memory_card_1_type.value()) + 1);
+  }
+  if (gs.memory_card_2_type.has_value())
+  {
+    QSignalBlocker sb(m_ui.userMemoryCard2Type);
+    m_ui.userMemoryCard2Type->setCurrentIndex(static_cast<int>(gs.memory_card_2_type.value()) + 1);
+  }
+  if (!gs.memory_card_1_shared_path.empty())
+  {
+    QSignalBlocker sb(m_ui.userMemoryCard1SharedPath);
+    m_ui.userMemoryCard1SharedPath->setText(QString::fromStdString(gs.memory_card_1_shared_path));
+  }
+  if (!gs.memory_card_2_shared_path.empty())
+  {
+    QSignalBlocker sb(m_ui.userMemoryCard2SharedPath);
+    m_ui.userMemoryCard2SharedPath->setText(QString::fromStdString(gs.memory_card_2_shared_path));
   }
 }
 
 void GamePropertiesDialog::saveGameSettings()
 {
-  m_host_interface->getGameList()->UpdateGameSettings(m_path, m_game_code, m_game_title, m_game_settings, true, true);
+  m_host_interface->getGameList()->UpdateGameSettings(m_path, m_game_code, m_game_title, m_game_settings, true);
   m_host_interface->applySettings(true);
 }
 
@@ -289,6 +490,50 @@ void GamePropertiesDialog::connectUi()
   connect(m_ui.exportCompatibilityInfo, &QPushButton::clicked, this,
           &GamePropertiesDialog::onExportCompatibilityInfoClicked);
   connect(m_ui.close, &QPushButton::clicked, this, &QDialog::close);
+  connect(m_ui.tabWidget, &QTabWidget::currentChanged, [this](int index) {
+    const bool show_buttons = index == 0;
+    m_ui.computeHashes->setVisible(show_buttons);
+    m_ui.verifyDump->setVisible(show_buttons);
+    m_ui.exportCompatibilityInfo->setVisible(show_buttons);
+  });
+
+  connect(m_ui.userRunaheadFrames, QOverload<int>::of(&QComboBox::currentIndexChanged), [this](int index) {
+    if (index <= 0)
+      m_game_settings.runahead_frames.reset();
+    else
+      m_game_settings.runahead_frames = static_cast<u32>(index - 1);
+    saveGameSettings();
+  });
+
+  connectBooleanUserSetting(m_ui.userEnableCPUClockSpeedControl, &m_game_settings.cpu_overclock_enable);
+  connect(m_ui.userEnableCPUClockSpeedControl, &QCheckBox::stateChanged, this,
+          &GamePropertiesDialog::updateCPUClockSpeedLabel);
+
+  connect(m_ui.userCPUClockSpeed, &QSlider::valueChanged, [this](int value) {
+    if (value == 100)
+    {
+      m_game_settings.cpu_overclock_numerator.reset();
+      m_game_settings.cpu_overclock_denominator.reset();
+    }
+    else
+    {
+      u32 numerator, denominator;
+      Settings::CPUOverclockPercentToFraction(static_cast<u32>(value), &numerator, &denominator);
+      m_game_settings.cpu_overclock_numerator = numerator;
+      m_game_settings.cpu_overclock_denominator = denominator;
+    }
+
+    saveGameSettings();
+    updateCPUClockSpeedLabel();
+  });
+
+  connect(m_ui.userCDROMReadSpeedup, QOverload<int>::of(&QComboBox::currentIndexChanged), [this](int index) {
+    if (index <= 0)
+      m_game_settings.cdrom_read_speedup.reset();
+    else
+      m_game_settings.cdrom_read_speedup = static_cast<u32>(index);
+    saveGameSettings();
+  });
 
   connect(m_ui.userAspectRatio, QOverload<int>::of(&QComboBox::currentIndexChanged), [this](int index) {
     if (index <= 0)
@@ -306,6 +551,58 @@ void GamePropertiesDialog::connectUi()
     saveGameSettings();
   });
 
+  connect(m_ui.userDownsampleMode, QOverload<int>::of(&QComboBox::currentIndexChanged), [this](int index) {
+    if (index <= 0)
+      m_game_settings.gpu_downsample_mode.reset();
+    else
+      m_game_settings.gpu_downsample_mode = static_cast<GPUDownsampleMode>(index - 1);
+    saveGameSettings();
+  });
+
+  connectBooleanUserSetting(m_ui.userLinearUpscaling, &m_game_settings.display_linear_upscaling);
+  connectBooleanUserSetting(m_ui.userIntegerUpscaling, &m_game_settings.display_integer_upscaling);
+
+  connect(m_ui.userResolutionScale, QOverload<int>::of(&QComboBox::currentIndexChanged), [this](int index) {
+    if (index <= 0)
+      m_game_settings.gpu_resolution_scale.reset();
+    else
+      m_game_settings.gpu_resolution_scale = static_cast<u32>(index - 1);
+    saveGameSettings();
+  });
+
+  connect(m_ui.userMSAAMode, QOverload<int>::of(&QComboBox::currentIndexChanged), [this](int index) {
+    if (index == 0)
+    {
+      m_game_settings.gpu_multisamples.reset();
+      m_game_settings.gpu_per_sample_shading.reset();
+    }
+    else
+    {
+      uint multisamples;
+      bool ssaa;
+      QtUtils::DecodeMSAAModeValue(m_ui.userMSAAMode->itemData(index), &multisamples, &ssaa);
+      m_game_settings.gpu_multisamples = static_cast<u32>(multisamples);
+      m_game_settings.gpu_per_sample_shading = ssaa;
+    }
+    saveGameSettings();
+  });
+
+  connect(m_ui.userTextureFiltering, QOverload<int>::of(&QComboBox::currentIndexChanged), [this](int index) {
+    if (index <= 0)
+      m_game_settings.gpu_texture_filter.reset();
+    else
+      m_game_settings.gpu_texture_filter = static_cast<GPUTextureFilter>(index - 1);
+    saveGameSettings();
+  });
+
+  connectBooleanUserSetting(m_ui.userTrueColor, &m_game_settings.gpu_true_color);
+  connectBooleanUserSetting(m_ui.userScaledDithering, &m_game_settings.gpu_scaled_dithering);
+  connectBooleanUserSetting(m_ui.userForceNTSCTimings, &m_game_settings.gpu_force_ntsc_timings);
+  connectBooleanUserSetting(m_ui.userWidescreenHack, &m_game_settings.gpu_widescreen_hack);
+  connectBooleanUserSetting(m_ui.userForce43For24Bit, &m_game_settings.display_force_4_3_for_24bit);
+  connectBooleanUserSetting(m_ui.userPGXP, &m_game_settings.gpu_pgxp);
+  connectBooleanUserSetting(m_ui.userPGXPDepthBuffer, &m_game_settings.gpu_pgxp_depth_buffer);
+
   connect(m_ui.userControllerType1, QOverload<int>::of(&QComboBox::currentIndexChanged), [this](int index) {
     if (index <= 0)
       m_game_settings.controller_1_type.reset();
@@ -322,12 +619,59 @@ void GamePropertiesDialog::connectUi()
     saveGameSettings();
   });
 
-  connect(m_ui.userWidescreenHack, &QCheckBox::stateChanged, [this](int state) {
-    if (state == Qt::PartiallyChecked)
-      m_game_settings.gpu_widescreen_hack.reset();
+  connect(m_ui.userInputProfile, QOverload<int>::of(&QComboBox::currentIndexChanged), [this](int index) {
+    if (index <= 0)
+      m_game_settings.input_profile_name = {};
     else
-      m_game_settings.gpu_widescreen_hack = (state == Qt::Checked);
+      m_game_settings.input_profile_name = m_ui.userInputProfile->itemText(index).toStdString();
     saveGameSettings();
+  });
+
+  connect(m_ui.userMemoryCard1Type, QOverload<int>::of(&QComboBox::currentIndexChanged), [this](int index) {
+    if (index <= 0)
+      m_game_settings.memory_card_1_type.reset();
+    else
+      m_game_settings.memory_card_1_type = static_cast<MemoryCardType>(index - 1);
+    saveGameSettings();
+  });
+  connect(m_ui.userMemoryCard1SharedPath, &QLineEdit::textChanged, [this](const QString& text) {
+    if (text.isEmpty())
+      std::string().swap(m_game_settings.memory_card_1_shared_path);
+    else
+      m_game_settings.memory_card_1_shared_path = text.toStdString();
+    saveGameSettings();
+  });
+  connect(m_ui.userMemoryCard1SharedPathBrowse, &QPushButton::clicked, [this]() {
+    QString path = QDir::toNativeSeparators(
+      QFileDialog::getOpenFileName(this, tr("Select path to memory card image"), QString(),
+                                   qApp->translate("MemoryCardSettingsWidget", MEMORY_CARD_IMAGE_FILTER)));
+    if (path.isEmpty())
+      return;
+
+    m_ui.userMemoryCard1SharedPath->setText(path);
+  });
+  connect(m_ui.userMemoryCard2Type, QOverload<int>::of(&QComboBox::currentIndexChanged), [this](int index) {
+    if (index <= 0)
+      m_game_settings.memory_card_2_type.reset();
+    else
+      m_game_settings.memory_card_2_type = static_cast<MemoryCardType>(index - 1);
+    saveGameSettings();
+  });
+  connect(m_ui.userMemoryCard2SharedPath, &QLineEdit::textChanged, [this](const QString& text) {
+    if (text.isEmpty())
+      std::string().swap(m_game_settings.memory_card_2_shared_path);
+    else
+      m_game_settings.memory_card_2_shared_path = text.toStdString();
+    saveGameSettings();
+  });
+  connect(m_ui.userMemoryCard2SharedPathBrowse, &QPushButton::clicked, [this]() {
+    QString path = QDir::toNativeSeparators(
+      QFileDialog::getOpenFileName(this, tr("Select path to memory card image"), QString(),
+                                   qApp->translate("MemoryCardSettingsWidget", MEMORY_CARD_IMAGE_FILTER)));
+    if (path.isEmpty())
+      return;
+
+    m_ui.userMemoryCard2SharedPath->setText(path);
   });
 
   for (u32 i = 0; i < static_cast<u32>(GameSettings::Trait::Count); i++)
@@ -352,6 +696,69 @@ void GamePropertiesDialog::connectUi()
       m_game_settings.display_active_end_offset = static_cast<s16>(value);
     saveGameSettings();
   });
+  connect(m_ui.displayLineStartOffset, QOverload<int>::of(&QSpinBox::valueChanged), [this](int value) {
+    if (value == 0)
+      m_game_settings.display_line_start_offset.reset();
+    else
+      m_game_settings.display_line_start_offset = static_cast<s16>(value);
+    saveGameSettings();
+  });
+  connect(m_ui.displayLineEndOffset, QOverload<int>::of(&QSpinBox::valueChanged), [this](int value) {
+    if (value == 0)
+      m_game_settings.display_line_end_offset.reset();
+    else
+      m_game_settings.display_line_end_offset = static_cast<s16>(value);
+    saveGameSettings();
+  });
+  connect(m_ui.dmaMaxSliceTicks, QOverload<int>::of(&QSpinBox::valueChanged), [this](int value) {
+    if (value == 0)
+      m_game_settings.dma_max_slice_ticks.reset();
+    else
+      m_game_settings.dma_max_slice_ticks = static_cast<u32>(value);
+    saveGameSettings();
+  });
+  connect(m_ui.dmaHaltTicks, QOverload<int>::of(&QSpinBox::valueChanged), [this](int value) {
+    if (value == 0)
+      m_game_settings.dma_halt_ticks.reset();
+    else
+      m_game_settings.dma_halt_ticks = static_cast<u32>(value);
+    saveGameSettings();
+  });
+  connect(m_ui.gpuFIFOSize, QOverload<int>::of(&QSpinBox::valueChanged), [this](int value) {
+    if (value == 0)
+      m_game_settings.gpu_fifo_size.reset();
+    else
+      m_game_settings.gpu_fifo_size = static_cast<u32>(value);
+    saveGameSettings();
+  });
+  connect(m_ui.gpuMaxRunAhead, QOverload<int>::of(&QSpinBox::valueChanged), [this](int value) {
+    if (value == 0)
+      m_game_settings.gpu_max_run_ahead.reset();
+    else
+      m_game_settings.gpu_max_run_ahead = static_cast<u32>(value);
+    saveGameSettings();
+  });
+  connect(m_ui.gpuPGXPTolerance, QOverload<double>::of(&QDoubleSpinBox::valueChanged), [this](double value) {
+    if (value < 0.0)
+      m_game_settings.gpu_pgxp_tolerance.reset();
+    else
+      m_game_settings.gpu_pgxp_tolerance = static_cast<float>(value);
+    saveGameSettings();
+  });
+  connect(m_ui.gpuPGXPDepthThreshold, QOverload<double>::of(&QDoubleSpinBox::valueChanged), [this](double value) {
+    if (value <= 0.0)
+      m_game_settings.gpu_pgxp_depth_threshold.reset();
+    else
+      m_game_settings.gpu_pgxp_depth_threshold = static_cast<float>(value);
+    saveGameSettings();
+  });
+}
+
+void GamePropertiesDialog::updateCPUClockSpeedLabel()
+{
+  const int percent = m_ui.userCPUClockSpeed->value();
+  const double frequency = (static_cast<double>(System::MASTER_CLOCK) * static_cast<double>(percent)) / 100.0;
+  m_ui.userCPUClockSpeedLabel->setText(tr("%1% (%2MHz)").arg(percent).arg(frequency / 1000000.0, 0, 'f', 2));
 }
 
 void GamePropertiesDialog::fillEntryFromUi(GameListCompatibilityEntry* entry)

@@ -15,8 +15,6 @@
     <ClCompile Include="$(IntDir)moc_mainwindow.cpp" />
     <ClCompile Include="$(IntDir)moc_qthostinterface.cpp" />
     <ClCompile Include="$(IntDir)moc_settingsdialog.cpp" />
-    <ClCompile Include="gpusettingswidget.cpp" />
-    <ClCompile Include="$(IntDir)moc_gpusettingswidget.cpp" />
     <ClCompile Include="inputbindingwidgets.cpp" />
     <ClCompile Include="hotkeysettingswidget.cpp" />
     <ClCompile Include="$(IntDir)moc_hotkeysettingswidget.cpp" />
@@ -33,6 +31,10 @@
     <ClCompile Include="$(IntDir)moc_advancedsettingswidget.cpp" />
     <ClCompile Include="gamepropertiesdialog.cpp" />
     <ClCompile Include="$(IntDir)moc_gamepropertiesdialog.cpp" />
+    <ClCompile Include="gdbconnection.cpp" />
+    <ClCompile Include="$(IntDir)moc_gdbconnection.cpp" />
+    <ClCompile Include="gdbserver.cpp" />
+    <ClCompile Include="$(IntDir)moc_gdbserver.cpp" />
     <ClCompile Include="controllersettingswidget.cpp" />
     <ClCompile Include="aboutdialog.cpp" />
     <ClCompile Include="memorycardsettingswidget.cpp" />
@@ -48,11 +50,39 @@
     <ClCompile Include="$(IntDir)moc_gamelistsearchdirectoriesmodel.cpp" />
     <ClCompile Include="autoupdaterdialog.cpp" />
     <ClCompile Include="$(IntDir)moc_autoupdaterdialog.cpp" />
+    <ClCompile Include="biossettingswidget.cpp" />
+    <ClCompile Include="enhancementsettingswidget.cpp" />
+    <ClCompile Include="displaysettingswidget.cpp" />
+    <ClCompile Include="memorycardeditordialog.cpp" />
+    <ClCompile Include="postprocessingchainconfigwidget.cpp" />
+    <ClCompile Include="postprocessingshaderconfigwidget.cpp" />
+    <ClCompile Include="postprocessingsettingswidget.cpp" />
+    <ClCompile Include="$(IntDir)moc_biossettingswidget.cpp" />
+    <ClCompile Include="$(IntDir)moc_enhancementsettingswidget.cpp" />
+    <ClCompile Include="$(IntDir)moc_displaysettingswidget.cpp" />
+    <ClCompile Include="$(IntDir)moc_memorycardeditordialog.cpp" />
+    <ClCompile Include="$(IntDir)moc_postprocessingchainconfigwidget.cpp" />
+    <ClCompile Include="$(IntDir)moc_postprocessingshaderconfigwidget.cpp" />
+    <ClCompile Include="$(IntDir)moc_postprocessingsettingswidget.cpp" />
+    <ClCompile Include="inputbindingmonitor.cpp" />
+    <ClCompile Include="cheatmanagerdialog.cpp" />
+    <ClCompile Include="cheatcodeeditordialog.cpp" />
+    <ClCompile Include="$(IntDir)moc_cheatmanagerdialog.cpp" />
+    <ClCompile Include="$(IntDir)moc_cheatcodeeditordialog.cpp" />
+    <ClCompile Include="debuggerwindow.cpp" />
+    <ClCompile Include="debuggermodels.cpp" />
+    <ClCompile Include="memoryviewwidget.cpp" />
+    <ClCompile Include="$(IntDir)moc_debuggermodels.cpp" />
+    <ClCompile Include="$(IntDir)moc_memoryviewwidget.cpp" />
+    <ClCompile Include="$(IntDir)moc_debuggerwindow.cpp" />
+    <ClCompile Include="emulationsettingswidget.cpp" />
+    <ClCompile Include="$(IntDir)moc_emulationsettingswidget.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="qtutils.h" />
     <ClInclude Include="settingwidgetbinder.h" />
     <ClInclude Include="resource.h" />
+    <ClInclude Include="inputbindingmonitor.h" />
   </ItemGroup>
   <ItemGroup>
     <Filter Include="resources">
@@ -63,16 +93,12 @@
     </Filter>
   </ItemGroup>
   <ItemGroup>
-    <QtResource Include="resources\resources.qrc" />
-  </ItemGroup>
-  <ItemGroup>
     <QtMoc Include="consolesettingswidget.h" />
     <QtMoc Include="gamelistsettingswidget.h" />
     <QtMoc Include="gamelistwidget.h" />
     <QtMoc Include="mainwindow.h" />
     <QtMoc Include="qthostinterface.h" />
     <QtMoc Include="settingsdialog.h" />
-    <QtMoc Include="gpusettingswidget.h" />
     <QtMoc Include="hotkeysettingswidget.h" />
     <QtMoc Include="inputbindingwidgets.h" />
     <QtMoc Include="audiosettingswidget.h" />
@@ -81,6 +107,8 @@
     <QtMoc Include="qtprogresscallback.h" />
     <QtMoc Include="advancedsettingswidget.h" />
     <QtMoc Include="gamepropertiesdialog.h" />
+    <QtMoc Include="gdbconnection.h" />
+    <QtMoc Include="gdbserver.h" />
     <QtMoc Include="controllersettingswidget.h" />
     <QtMoc Include="aboutdialog.h" />
     <QtMoc Include="memorycardsettingswidget.h" />
@@ -88,13 +116,25 @@
     <QtMoc Include="gamelistmodel.h" />
     <QtMoc Include="gamelistsearchdirectoriesmodel.h" />
     <QtMoc Include="autoupdaterdialog.h" />
+    <QtMoc Include="biossettingswidget.h" />
+    <QtMoc Include="enhancementsettingswidget.h" />
+    <QtMoc Include="memorycardeditordialog.h" />
+    <QtMoc Include="displaysettingswidget.h" />
+    <QtMoc Include="postprocessingchainconfigwidget.h" />
+    <QtMoc Include="postprocessingshaderconfigwidget.h" />
+    <QtMoc Include="postprocessingsettingswidget.h" />
+    <QtMoc Include="cheatmanagerdialog.h" />
+    <QtMoc Include="cheatcodeeditordialog.h" />
+    <QtMoc Include="debuggermodels.h" />
+    <QtMoc Include="debuggerwindow.h" />
+    <QtMoc Include="memoryviewwidget.h" />
+    <QtMoc Include="emulationsettingswidget.h" />
   </ItemGroup>
   <ItemGroup>
     <QtUi Include="consolesettingswidget.ui" />
     <QtUi Include="gamelistsettingswidget.ui" />
     <QtUi Include="mainwindow.ui" />
     <QtUi Include="settingsdialog.ui" />
-    <QtUi Include="gpusettingswidget.ui" />
     <QtUi Include="audiosettingswidget.ui" />
     <QtUi Include="generalsettingswidget.ui" />
     <QtUi Include="advancedsettingswidget.ui" />
@@ -102,6 +142,15 @@
     <QtUi Include="aboutdialog.ui" />
     <QtUi Include="inputbindingdialog.ui" />
     <QtUi Include="autoupdaterdialog.ui" />
+    <QtUi Include="biossettingswidget.ui" />
+    <QtUi Include="enhancementsettingswidget.ui" />
+    <QtUi Include="displaysettingswidget.ui" />
+    <QtUi Include="postprocessingchainconfigwidget.ui" />
+    <QtUi Include="postprocessingsettingswidget.ui" />
+    <QtUi Include="memorycardeditordialog.ui" />
+    <QtUi Include="cheatmanagerdialog.ui" />
+    <QtUi Include="cheatcodeeditordialog.ui" />
+    <QtUi Include="emulationsettingswidget.ui" />
   </ItemGroup>
   <ItemGroup>
     <Natvis Include="qt5.natvis" />
@@ -113,10 +162,33 @@
     <Image Include="duckstation-qt.ico" />
   </ItemGroup>
   <ItemGroup>
+    <QtResource Include="resources\resources.qrc">
+      <Filter>resources</Filter>
+    </QtResource>
+  </ItemGroup>
+  <ItemGroup>
+    <None Include="debuggerwindow.ui" />
+  </ItemGroup>
+  <ItemGroup>
     <QtTs Include="translations\duckstation-qt_de.ts">
       <Filter>translations</Filter>
     </QtTs>
+    <QtTs Include="translations\duckstation-qt_es.ts">
+      <Filter>translations</Filter>
+    </QtTs>
+    <QtTs Include="translations\duckstation-qt_fr.ts">
+      <Filter>translations</Filter>
+    </QtTs>
     <QtTs Include="translations\duckstation-qt_he.ts">
+      <Filter>translations</Filter>
+    </QtTs>
+    <QtTs Include="translations\duckstation-qt_it.ts">
+      <Filter>translations</Filter>
+    </QtTs>
+    <QtTs Include="translations\duckstation-qt_ja.ts">
+      <Filter>translations</Filter>
+    </QtTs>
+    <QtTs Include="translations\duckstation-qt_nl.ts">
       <Filter>translations</Filter>
     </QtTs>
     <QtTs Include="translations\duckstation-qt_pt-br.ts">
@@ -125,16 +197,14 @@
     <QtTs Include="translations\duckstation-qt_pt-pt.ts">
       <Filter>translations</Filter>
     </QtTs>
+    <QtTs Include="translations\duckstation-qt_ru.ts">
+      <Filter>translations</Filter>
+    </QtTs>
     <QtTs Include="translations\duckstation-qt_zh-cn.ts">
       <Filter>translations</Filter>
     </QtTs>
-  </ItemGroup>
-  <ItemGroup>
-    <None Include="translations\duckstation-qt_es.ts">
+    <QtTs Include="translations\duckstation-qt_pl.ts">
       <Filter>translations</Filter>
-    </None>
-    <None Include="translations\duckstation-qt_it.ts">
-      <Filter>translations</Filter>
-    </None>
+    </QtTs>
   </ItemGroup>
 </Project>

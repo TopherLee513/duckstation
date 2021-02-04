@@ -1,16 +1,19 @@
 #include "d3d11_host_display.h"
 #include "common/assert.h"
+#include "common/d3d11/shader_cache.h"
 #include "common/d3d11/shader_compiler.h"
 #include "common/log.h"
 #include "common/string_util.h"
+#include "core/host_interface.h"
+#include "core/settings.h"
+#include "core/shader_cache_version.h"
 #include "display_ps.hlsl.h"
 #include "display_vs.hlsl.h"
+#include "frontend-common/postprocessing_shadergen.h"
+#include "imgui.h"
+#include "imgui_impl_dx11.h"
 #include <array>
-#ifndef LIBRETRO
 #include <dxgi1_5.h>
-#include <imgui.h>
-#include <imgui_impl_dx11.h>
-#endif
 Log_SetChannel(D3D11HostDisplay);
 
 namespace FrontendCommon {
@@ -18,52 +21,28 @@ namespace FrontendCommon {
 class D3D11HostDisplayTexture : public HostDisplayTexture
 {
 public:
-  template<typename T>
-  using ComPtr = Microsoft::WRL::ComPtr<T>;
-
-  D3D11HostDisplayTexture(ComPtr<ID3D11Texture2D> texture, ComPtr<ID3D11ShaderResourceView> srv, u32 width, u32 height,
-                          bool dynamic)
-    : m_texture(std::move(texture)), m_srv(std::move(srv)), m_width(width), m_height(height), m_dynamic(dynamic)
+  D3D11HostDisplayTexture(D3D11::Texture texture, HostDisplayPixelFormat format, bool dynamic)
+    : m_texture(std::move(texture)), m_format(format), m_dynamic(dynamic)
   {
   }
   ~D3D11HostDisplayTexture() override = default;
 
-  void* GetHandle() const override { return m_srv.Get(); }
-  u32 GetWidth() const override { return m_width; }
-  u32 GetHeight() const override { return m_height; }
+  void* GetHandle() const override { return m_texture.GetD3DSRV(); }
+  u32 GetWidth() const override { return m_texture.GetWidth(); }
+  u32 GetHeight() const override { return m_texture.GetHeight(); }
+  u32 GetLayers() const override { return 1; }
+  u32 GetLevels() const override { return m_texture.GetLevels(); }
+  u32 GetSamples() const override { return m_texture.GetSamples(); }
+  HostDisplayPixelFormat GetFormat() const override { return m_format; }
 
-  ID3D11Texture2D* GetD3DTexture() const { return m_texture.Get(); }
-  ID3D11ShaderResourceView* GetD3DSRV() const { return m_srv.Get(); }
-  ID3D11ShaderResourceView* const* GetD3DSRVArray() const { return m_srv.GetAddressOf(); }
-  bool IsDynamic() const { return m_dynamic; }
-
-  static std::unique_ptr<D3D11HostDisplayTexture> Create(ID3D11Device* device, u32 width, u32 height, const void* data,
-                                                         u32 data_stride, bool dynamic)
-  {
-    const CD3D11_TEXTURE2D_DESC desc(DXGI_FORMAT_R8G8B8A8_UNORM, width, height, 1, 1, D3D11_BIND_SHADER_RESOURCE,
-                                     dynamic ? D3D11_USAGE_DYNAMIC : D3D11_USAGE_DEFAULT,
-                                     dynamic ? D3D11_CPU_ACCESS_WRITE : 0, 1, 0, 0);
-    const D3D11_SUBRESOURCE_DATA srd{data, data_stride, data_stride * height};
-    ComPtr<ID3D11Texture2D> texture;
-    HRESULT hr = device->CreateTexture2D(&desc, data ? &srd : nullptr, texture.GetAddressOf());
-    if (FAILED(hr))
-      return {};
-
-    const CD3D11_SHADER_RESOURCE_VIEW_DESC srv_desc(D3D11_SRV_DIMENSION_TEXTURE2D, DXGI_FORMAT_R8G8B8A8_UNORM, 0, 1, 0,
-                                                    1);
-    ComPtr<ID3D11ShaderResourceView> srv;
-    hr = device->CreateShaderResourceView(texture.Get(), &srv_desc, srv.GetAddressOf());
-    if (FAILED(hr))
-      return {};
-
-    return std::make_unique<D3D11HostDisplayTexture>(std::move(texture), std::move(srv), width, height, dynamic);
-  }
+  ALWAYS_INLINE ID3D11Texture2D* GetD3DTexture() const { return m_texture.GetD3DTexture(); }
+  ALWAYS_INLINE ID3D11ShaderResourceView* GetD3DSRV() const { return m_texture.GetD3DSRV(); }
+  ALWAYS_INLINE ID3D11ShaderResourceView* const* GetD3DSRVArray() const { return m_texture.GetD3DSRVArray(); }
+  ALWAYS_INLINE bool IsDynamic() const { return m_dynamic; }
 
 private:
-  ComPtr<ID3D11Texture2D> m_texture;
-  ComPtr<ID3D11ShaderResourceView> m_srv;
-  u32 m_width;
-  u32 m_height;
+  D3D11::Texture m_texture;
+  HostDisplayPixelFormat m_format;
   bool m_dynamic;
 };
 
@@ -72,9 +51,7 @@ D3D11HostDisplay::D3D11HostDisplay() = default;
 D3D11HostDisplay::~D3D11HostDisplay()
 {
   AssertMsg(!m_context, "Context should have been destroyed by now");
-#ifndef LIBRETRO
   AssertMsg(!m_swap_chain, "Swap chain should have been destroyed by now");
-#endif
 }
 
 HostDisplay::RenderAPI D3D11HostDisplay::GetRenderAPI() const
@@ -99,17 +76,30 @@ bool D3D11HostDisplay::HasRenderDevice() const
 
 bool D3D11HostDisplay::HasRenderSurface() const
 {
-#ifndef LIBRETRO
   return static_cast<bool>(m_swap_chain);
-#else
-  return true;
-#endif
 }
 
-std::unique_ptr<HostDisplayTexture> D3D11HostDisplay::CreateTexture(u32 width, u32 height, const void* initial_data,
-                                                                    u32 initial_data_stride, bool dynamic)
+static constexpr std::array<DXGI_FORMAT, static_cast<u32>(HostDisplayPixelFormat::Count)>
+  s_display_pixel_format_mapping = {{DXGI_FORMAT_UNKNOWN, DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_B8G8R8A8_UNORM,
+                                     DXGI_FORMAT_B5G6R5_UNORM, DXGI_FORMAT_B5G5R5A1_UNORM}};
+
+std::unique_ptr<HostDisplayTexture> D3D11HostDisplay::CreateTexture(u32 width, u32 height, u32 layers, u32 levels,
+                                                                    u32 samples, HostDisplayPixelFormat format,
+                                                                    const void* data, u32 data_stride,
+                                                                    bool dynamic /* = false */)
 {
-  return D3D11HostDisplayTexture::Create(m_device.Get(), width, height, initial_data, initial_data_stride, dynamic);
+  if (layers != 1)
+    return {};
+
+  D3D11::Texture tex;
+  if (!tex.Create(m_device.Get(), width, height, levels, samples,
+                  s_display_pixel_format_mapping[static_cast<u32>(format)], D3D11_BIND_SHADER_RESOURCE, data,
+                  data_stride, dynamic))
+  {
+    return {};
+  }
+
+  return std::make_unique<D3D11HostDisplayTexture>(std::move(tex), format, dynamic);
 }
 
 void D3D11HostDisplay::UpdateTexture(HostDisplayTexture* texture, u32 x, u32 y, u32 width, u32 height,
@@ -149,34 +139,108 @@ void D3D11HostDisplay::UpdateTexture(HostDisplayTexture* texture, u32 x, u32 y, 
   }
 }
 
-bool D3D11HostDisplay::DownloadTexture(const void* texture_handle, u32 x, u32 y, u32 width, u32 height, void* out_data,
-                                       u32 out_data_stride)
+bool D3D11HostDisplay::DownloadTexture(const void* texture_handle, HostDisplayPixelFormat texture_format, u32 x, u32 y,
+                                       u32 width, u32 height, void* out_data, u32 out_data_stride)
 {
   ID3D11ShaderResourceView* srv =
     const_cast<ID3D11ShaderResourceView*>(static_cast<const ID3D11ShaderResourceView*>(texture_handle));
-  ID3D11Resource* srv_resource;
+  ComPtr<ID3D11Resource> srv_resource;
   D3D11_SHADER_RESOURCE_VIEW_DESC srv_desc;
-  srv->GetResource(&srv_resource);
+  srv->GetResource(srv_resource.GetAddressOf());
   srv->GetDesc(&srv_desc);
 
   if (!m_readback_staging_texture.EnsureSize(m_context.Get(), width, height, srv_desc.Format, false))
     return false;
 
-  m_readback_staging_texture.CopyFromTexture(m_context.Get(), srv_resource, 0, x, y, 0, 0, width, height);
-  return m_readback_staging_texture.ReadPixels<u32>(m_context.Get(), 0, 0, width, height, out_data_stride / sizeof(u32),
-                                                    static_cast<u32*>(out_data));
+  m_readback_staging_texture.CopyFromTexture(m_context.Get(), srv_resource.Get(), 0, x, y, 0, 0, width, height);
+
+  if (srv_desc.Format == DXGI_FORMAT_B5G6R5_UNORM || srv_desc.Format == DXGI_FORMAT_B5G5R5A1_UNORM)
+  {
+    return m_readback_staging_texture.ReadPixels<u16>(m_context.Get(), 0, 0, width, height,
+                                                      out_data_stride / sizeof(u16), static_cast<u16*>(out_data));
+  }
+  else
+  {
+    return m_readback_staging_texture.ReadPixels<u32>(m_context.Get(), 0, 0, width, height,
+                                                      out_data_stride / sizeof(u32), static_cast<u32*>(out_data));
+  }
+}
+
+bool D3D11HostDisplay::SupportsDisplayPixelFormat(HostDisplayPixelFormat format) const
+{
+  const DXGI_FORMAT dfmt = s_display_pixel_format_mapping[static_cast<u32>(format)];
+  if (dfmt == DXGI_FORMAT_UNKNOWN)
+    return false;
+
+  UINT support = 0;
+  const UINT required = D3D11_FORMAT_SUPPORT_TEXTURE2D | D3D11_FORMAT_SUPPORT_SHADER_SAMPLE;
+  return (SUCCEEDED(m_device->CheckFormatSupport(dfmt, &support)) && ((support & required) == required));
+}
+
+bool D3D11HostDisplay::BeginSetDisplayPixels(HostDisplayPixelFormat format, u32 width, u32 height, void** out_buffer,
+                                             u32* out_pitch)
+{
+  ClearDisplayTexture();
+
+  const DXGI_FORMAT dxgi_format = s_display_pixel_format_mapping[static_cast<u32>(format)];
+  if (m_display_pixels_texture.GetWidth() < width || m_display_pixels_texture.GetHeight() < height ||
+      m_display_pixels_texture.GetFormat() != dxgi_format)
+  {
+    if (!m_display_pixels_texture.Create(m_device.Get(), width, height, 1, 1, dxgi_format, D3D11_BIND_SHADER_RESOURCE,
+                                         nullptr, 0, true))
+    {
+      return false;
+    }
+  }
+
+  D3D11_MAPPED_SUBRESOURCE sr;
+  HRESULT hr = m_context->Map(m_display_pixels_texture.GetD3DTexture(), 0, D3D11_MAP_WRITE_DISCARD, 0, &sr);
+  if (FAILED(hr))
+  {
+    Log_ErrorPrintf("Map pixels texture failed: %08X", hr);
+    return false;
+  }
+
+  *out_buffer = sr.pData;
+  *out_pitch = sr.RowPitch;
+
+  SetDisplayTexture(m_display_pixels_texture.GetD3DSRV(), format, m_display_pixels_texture.GetWidth(),
+                    m_display_pixels_texture.GetHeight(), 0, 0, static_cast<u32>(width), static_cast<u32>(height));
+  return true;
+}
+
+void D3D11HostDisplay::EndSetDisplayPixels()
+{
+  m_context->Unmap(m_display_pixels_texture.GetD3DTexture(), 0);
+}
+
+bool D3D11HostDisplay::GetHostRefreshRate(float* refresh_rate)
+{
+  if (m_swap_chain && IsFullscreen())
+  {
+    DXGI_SWAP_CHAIN_DESC desc;
+    if (SUCCEEDED(m_swap_chain->GetDesc(&desc)) && desc.BufferDesc.RefreshRate.Numerator > 0 &&
+        desc.BufferDesc.RefreshRate.Denominator > 0)
+    {
+      Log_InfoPrintf("using fs rr: %u %u", desc.BufferDesc.RefreshRate.Numerator,
+                     desc.BufferDesc.RefreshRate.Denominator);
+      *refresh_rate = static_cast<float>(desc.BufferDesc.RefreshRate.Numerator) /
+                      static_cast<float>(desc.BufferDesc.RefreshRate.Denominator);
+      return true;
+    }
+  }
+
+  return HostDisplay::GetHostRefreshRate(refresh_rate);
 }
 
 void D3D11HostDisplay::SetVSync(bool enabled)
 {
-#ifndef LIBRETRO
   m_vsync = enabled;
-#endif
 }
 
-bool D3D11HostDisplay::CreateRenderDevice(const WindowInfo& wi, std::string_view adapter_name, bool debug_device)
+bool D3D11HostDisplay::CreateRenderDevice(const WindowInfo& wi, std::string_view adapter_name, bool debug_device,
+                                          bool threaded_presentation)
 {
-#ifndef LIBRETRO
   UINT create_flags = 0;
   if (debug_device)
     create_flags |= D3D11_CREATE_DEVICE_DEBUG;
@@ -192,16 +256,16 @@ bool D3D11HostDisplay::CreateRenderDevice(const WindowInfo& wi, std::string_view
   u32 adapter_index;
   if (!adapter_name.empty())
   {
-    std::vector<std::string> adapter_names = EnumerateAdapterNames(temp_dxgi_factory.Get());
-    for (adapter_index = 0; adapter_index < static_cast<u32>(adapter_names.size()); adapter_index++)
+    AdapterInfo adapter_info = GetAdapterInfo(temp_dxgi_factory.Get());
+    for (adapter_index = 0; adapter_index < static_cast<u32>(adapter_info.adapter_names.size()); adapter_index++)
     {
-      if (adapter_name == adapter_names[adapter_index])
+      if (adapter_name == adapter_info.adapter_names[adapter_index])
         break;
     }
-    if (adapter_index == static_cast<u32>(adapter_names.size()))
+    if (adapter_index == static_cast<u32>(adapter_info.adapter_names.size()))
     {
       Log_WarningPrintf("Could not find adapter '%s', using first (%s)", std::string(adapter_name).c_str(),
-                        adapter_names[0].c_str());
+                        adapter_info.adapter_names[0].c_str());
       adapter_index = 0;
     }
   }
@@ -279,40 +343,25 @@ bool D3D11HostDisplay::CreateRenderDevice(const WindowInfo& wi, std::string_view
     if (SUCCEEDED(hr))
       m_allow_tearing_supported = (allow_tearing_supported == TRUE);
   }
-#endif
 
   m_window_info = wi;
   return true;
 }
 
-bool D3D11HostDisplay::InitializeRenderDevice(std::string_view shader_cache_directory, bool debug_device)
+bool D3D11HostDisplay::InitializeRenderDevice(std::string_view shader_cache_directory, bool debug_device,
+                                              bool threaded_presentation)
 {
-#ifndef LIBRETRO
-  if (m_window_info.type != WindowInfo::Type::Surfaceless && m_window_info.type != WindowInfo::Type::Libretro &&
-      !CreateSwapChain())
-  {
+  if (m_window_info.type != WindowInfo::Type::Surfaceless && !CreateSwapChain(nullptr))
     return false;
-  }
-#endif
 
   if (!CreateResources())
     return false;
-
-#ifndef LIBRETRO
-  if (ImGui::GetCurrentContext() && !CreateImGuiContext())
-    return false;
-#endif
 
   return true;
 }
 
 void D3D11HostDisplay::DestroyRenderDevice()
 {
-#ifndef LIBRETRO
-  if (ImGui::GetCurrentContext())
-    DestroyImGuiContext();
-#endif
-
   DestroyResources();
   DestroyRenderSurface();
   m_context.Reset();
@@ -329,14 +378,13 @@ bool D3D11HostDisplay::DoneRenderContextCurrent()
   return true;
 }
 
-#ifndef LIBRETRO
-
-bool D3D11HostDisplay::CreateSwapChain()
+bool D3D11HostDisplay::CreateSwapChain(const DXGI_MODE_DESC* fullscreen_mode)
 {
   if (m_window_info.type != WindowInfo::Type::Win32)
     return false;
 
-  m_using_flip_model_swap_chain = true;
+  m_using_flip_model_swap_chain =
+    fullscreen_mode || !g_host_interface->GetBoolSettingValue("Display", "UseBlitSwapChain", false);
 
   const HWND window_hwnd = reinterpret_cast<HWND>(m_window_info.window_handle);
   RECT client_rc{};
@@ -355,12 +403,19 @@ bool D3D11HostDisplay::CreateSwapChain()
   swap_chain_desc.Windowed = TRUE;
   swap_chain_desc.SwapEffect = m_using_flip_model_swap_chain ? DXGI_SWAP_EFFECT_FLIP_DISCARD : DXGI_SWAP_EFFECT_DISCARD;
 
-  m_using_allow_tearing = (m_allow_tearing_supported && m_using_flip_model_swap_chain);
+  m_using_allow_tearing = (m_allow_tearing_supported && m_using_flip_model_swap_chain && !fullscreen_mode);
   if (m_using_allow_tearing)
-    swap_chain_desc.Flags = DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING;
+    swap_chain_desc.Flags |= DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING;
 
-  Log_InfoPrintf("Creating a %dx%d %s %s swap chain", width, height,
-                 m_using_flip_model_swap_chain ? "flip-discard" : "discard",
+  if (fullscreen_mode)
+  {
+    swap_chain_desc.Flags = DXGI_SWAP_CHAIN_FLAG_ALLOW_MODE_SWITCH;
+    swap_chain_desc.Windowed = FALSE;
+    swap_chain_desc.BufferDesc = *fullscreen_mode;
+  }
+
+  Log_InfoPrintf("Creating a %dx%d %s %s swap chain", swap_chain_desc.BufferDesc.Width,
+                 swap_chain_desc.BufferDesc.Height, m_using_flip_model_swap_chain ? "flip-discard" : "discard",
                  swap_chain_desc.Windowed ? "windowed" : "full-screen");
 
   HRESULT hr = m_dxgi_factory->CreateSwapChain(m_device.Get(), &swap_chain_desc, m_swap_chain.GetAddressOf());
@@ -421,32 +476,25 @@ bool D3D11HostDisplay::CreateSwapChainRTV()
   return true;
 }
 
-#endif
-
 bool D3D11HostDisplay::ChangeRenderWindow(const WindowInfo& new_wi)
 {
-#ifndef LIBRETRO
   DestroyRenderSurface();
 
   m_window_info = new_wi;
-  return CreateSwapChain();
-#else
-  m_window_info = new_wi;
-  return true;
-#endif
+  return CreateSwapChain(nullptr);
 }
 
 void D3D11HostDisplay::DestroyRenderSurface()
 {
-#ifndef LIBRETRO
+  if (IsFullscreen())
+    SetFullscreen(false, 0, 0, 0.0f);
+
   m_swap_chain_rtv.Reset();
   m_swap_chain.Reset();
-#endif
 }
 
 void D3D11HostDisplay::ResizeRenderWindow(s32 new_window_width, s32 new_window_height)
 {
-#ifndef LIBRETRO
   if (!m_swap_chain)
     return;
 
@@ -459,7 +507,79 @@ void D3D11HostDisplay::ResizeRenderWindow(s32 new_window_width, s32 new_window_h
 
   if (!CreateSwapChainRTV())
     Panic("Failed to recreate swap chain RTV after resize");
-#endif
+}
+
+bool D3D11HostDisplay::SupportsFullscreen() const
+{
+  return true;
+}
+
+bool D3D11HostDisplay::IsFullscreen()
+{
+  BOOL is_fullscreen = FALSE;
+  return (m_swap_chain && SUCCEEDED(m_swap_chain->GetFullscreenState(&is_fullscreen, nullptr)) && is_fullscreen);
+}
+
+bool D3D11HostDisplay::SetFullscreen(bool fullscreen, u32 width, u32 height, float refresh_rate)
+{
+  if (!m_swap_chain)
+    return false;
+
+  BOOL is_fullscreen = FALSE;
+  HRESULT hr = m_swap_chain->GetFullscreenState(&is_fullscreen, nullptr);
+  if (!fullscreen)
+  {
+    // leaving fullscreen
+    if (is_fullscreen)
+      return SUCCEEDED(m_swap_chain->SetFullscreenState(FALSE, nullptr));
+    else
+      return true;
+  }
+
+  IDXGIOutput* output;
+  if (FAILED(hr = m_swap_chain->GetContainingOutput(&output)))
+    return false;
+
+  DXGI_SWAP_CHAIN_DESC current_desc;
+  hr = m_swap_chain->GetDesc(&current_desc);
+  if (FAILED(hr))
+    return false;
+
+  DXGI_MODE_DESC new_mode = current_desc.BufferDesc;
+  new_mode.Width = width;
+  new_mode.Height = height;
+  new_mode.RefreshRate.Numerator = static_cast<UINT>(std::floor(refresh_rate * 1000.0f));
+  new_mode.RefreshRate.Denominator = 1000u;
+
+  DXGI_MODE_DESC closest_mode;
+  if (FAILED(hr = output->FindClosestMatchingMode(&new_mode, &closest_mode, nullptr)) ||
+      new_mode.Format != current_desc.BufferDesc.Format)
+  {
+    Log_ErrorPrintf("Failed to find closest matching mode, hr=%08X", hr);
+    return false;
+  }
+
+  if (new_mode.Width == current_desc.BufferDesc.Width && new_mode.Height == current_desc.BufferDesc.Width &&
+      new_mode.RefreshRate.Numerator == current_desc.BufferDesc.RefreshRate.Numerator &&
+      new_mode.RefreshRate.Denominator == current_desc.BufferDesc.RefreshRate.Denominator)
+  {
+    Log_InfoPrintf("Fullscreen mode already set");
+    return true;
+  }
+
+  m_swap_chain_rtv.Reset();
+  m_swap_chain.Reset();
+
+  if (!CreateSwapChain(&closest_mode))
+  {
+    Log_ErrorPrintf("Failed to create a fullscreen swap chain");
+    if (!CreateSwapChain(nullptr))
+      Panic("Failed to recreate windowed swap chain");
+
+    return false;
+  }
+
+  return true;
 }
 
 bool D3D11HostDisplay::CreateResources()
@@ -522,6 +642,10 @@ bool D3D11HostDisplay::CreateResources()
 
 void D3D11HostDisplay::DestroyResources()
 {
+  m_post_processing_chain.ClearStages();
+  m_post_processing_input_texture.Destroy();
+  m_post_processing_stages.clear();
+
   m_display_uniform_buffer.Release();
   m_linear_sampler.Reset();
   m_point_sampler.Reset();
@@ -532,28 +656,34 @@ void D3D11HostDisplay::DestroyResources()
   m_display_rasterizer_state.Reset();
 }
 
-#ifndef LIBRETRO
 bool D3D11HostDisplay::CreateImGuiContext()
 {
   ImGui::GetIO().DisplaySize.x = static_cast<float>(m_window_info.surface_width);
   ImGui::GetIO().DisplaySize.y = static_cast<float>(m_window_info.surface_height);
-
-  if (!ImGui_ImplDX11_Init(m_device.Get(), m_context.Get()))
-    return false;
-
-  ImGui_ImplDX11_NewFrame();
-  return true;
+  return ImGui_ImplDX11_Init(m_device.Get(), m_context.Get());
 }
 
 void D3D11HostDisplay::DestroyImGuiContext()
 {
   ImGui_ImplDX11_Shutdown();
 }
-#endif
+
+bool D3D11HostDisplay::UpdateImGuiFontTexture()
+{
+  ImGui_ImplDX11_CreateFontsTexture();
+  return true;
+}
 
 bool D3D11HostDisplay::Render()
 {
-#ifndef LIBRETRO
+  if (ShouldSkipDisplayingFrame())
+  {
+    if (ImGui::GetCurrentContext())
+      ImGui::Render();
+
+    return false;
+  }
+
   static constexpr std::array<float, 4> clear_color = {};
   m_context->ClearRenderTargetView(m_swap_chain_rtv.Get(), clear_color.data());
   m_context->OMSetRenderTargets(1, m_swap_chain_rtv.GetAddressOf(), nullptr);
@@ -570,17 +700,8 @@ bool D3D11HostDisplay::Render()
   else
     m_swap_chain->Present(BoolToUInt32(m_vsync), 0);
 
-  if (ImGui::GetCurrentContext())
-    ImGui_ImplDX11_NewFrame();
-#else
-  RenderDisplay();
-  RenderSoftwareCursor();
-#endif
-
   return true;
 }
-
-#ifndef LIBRETRO
 
 void D3D11HostDisplay::RenderImGui()
 {
@@ -588,14 +709,21 @@ void D3D11HostDisplay::RenderImGui()
   ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
 }
 
-#endif
-
 void D3D11HostDisplay::RenderDisplay()
 {
   if (!HasDisplayTexture())
     return;
 
   const auto [left, top, width, height] = CalculateDrawRect(GetWindowWidth(), GetWindowHeight(), m_display_top_margin);
+
+  if (!m_post_processing_chain.IsEmpty())
+  {
+    ApplyPostProcessingChain(m_swap_chain_rtv.Get(), left, top, width, height, m_display_texture_handle,
+                             m_display_texture_width, m_display_texture_height, m_display_texture_view_x,
+                             m_display_texture_view_y, m_display_texture_view_width, m_display_texture_view_height);
+    return;
+  }
+
   RenderDisplay(left, top, width, height, m_display_texture_handle, m_display_texture_width, m_display_texture_height,
                 m_display_texture_view_x, m_display_texture_view_y, m_display_texture_view_width,
                 m_display_texture_view_height, m_display_linear_filtering);
@@ -611,11 +739,14 @@ void D3D11HostDisplay::RenderDisplay(s32 left, s32 top, s32 width, s32 height, v
   m_context->PSSetShaderResources(0, 1, reinterpret_cast<ID3D11ShaderResourceView**>(&texture_handle));
   m_context->PSSetSamplers(0, 1, linear_filter ? m_linear_sampler.GetAddressOf() : m_point_sampler.GetAddressOf());
 
-  const float uniforms[4] = {static_cast<float>(texture_view_x) / static_cast<float>(texture_width),
-                             static_cast<float>(texture_view_y) / static_cast<float>(texture_height),
-                             (static_cast<float>(texture_view_width) - 0.5f) / static_cast<float>(texture_width),
-                             (static_cast<float>(texture_view_height) - 0.5f) / static_cast<float>(texture_height)};
-  const auto map = m_display_uniform_buffer.Map(m_context.Get(), sizeof(uniforms), sizeof(uniforms));
+  const float position_adjust = m_display_linear_filtering ? 0.5f : 0.0f;
+  const float size_adjust = m_display_linear_filtering ? 1.0f : 0.0f;
+  const float uniforms[4] = {
+    (static_cast<float>(texture_view_x) + position_adjust) / static_cast<float>(texture_width),
+    (static_cast<float>(texture_view_y) + position_adjust) / static_cast<float>(texture_height),
+    (static_cast<float>(texture_view_width) - size_adjust) / static_cast<float>(texture_width),
+    (static_cast<float>(texture_view_height) - size_adjust) / static_cast<float>(texture_height)};
+  const auto map = m_display_uniform_buffer.Map(m_context.Get(), m_display_uniform_buffer.GetSize(), sizeof(uniforms));
   std::memcpy(map.pointer, uniforms, sizeof(uniforms));
   m_display_uniform_buffer.Unmap(m_context.Get(), sizeof(uniforms));
   m_context->VSSetConstantBuffers(0, 1, m_display_uniform_buffer.GetD3DBufferArray());
@@ -649,7 +780,7 @@ void D3D11HostDisplay::RenderSoftwareCursor(s32 left, s32 top, s32 width, s32 he
   m_context->PSSetSamplers(0, 1, m_linear_sampler.GetAddressOf());
 
   const float uniforms[4] = {0.0f, 0.0f, 1.0f, 1.0f};
-  const auto map = m_display_uniform_buffer.Map(m_context.Get(), sizeof(uniforms), sizeof(uniforms));
+  const auto map = m_display_uniform_buffer.Map(m_context.Get(), m_display_uniform_buffer.GetSize(), sizeof(uniforms));
   std::memcpy(map.pointer, uniforms, sizeof(uniforms));
   m_display_uniform_buffer.Unmap(m_context.Get(), sizeof(uniforms));
   m_context->VSSetConstantBuffers(0, 1, m_display_uniform_buffer.GetD3DBufferArray());
@@ -664,24 +795,22 @@ void D3D11HostDisplay::RenderSoftwareCursor(s32 left, s32 top, s32 width, s32 he
   m_context->Draw(3, 0);
 }
 
-#ifndef LIBRETRO
-
-std::vector<std::string> D3D11HostDisplay::EnumerateAdapterNames()
+D3D11HostDisplay::AdapterInfo D3D11HostDisplay::GetAdapterInfo()
 {
   ComPtr<IDXGIFactory> dxgi_factory;
   HRESULT hr = CreateDXGIFactory(IID_PPV_ARGS(dxgi_factory.GetAddressOf()));
   if (FAILED(hr))
     return {};
 
-  return EnumerateAdapterNames(dxgi_factory.Get());
+  return GetAdapterInfo(dxgi_factory.Get());
 }
 
-std::vector<std::string> D3D11HostDisplay::EnumerateAdapterNames(IDXGIFactory* dxgi_factory)
+D3D11HostDisplay::AdapterInfo D3D11HostDisplay::GetAdapterInfo(IDXGIFactory* dxgi_factory)
 {
-  std::vector<std::string> adapter_names;
+  AdapterInfo adapter_info;
   ComPtr<IDXGIAdapter> current_adapter;
-  while (SUCCEEDED(
-    dxgi_factory->EnumAdapters(static_cast<UINT>(adapter_names.size()), current_adapter.ReleaseAndGetAddressOf())))
+  while (SUCCEEDED(dxgi_factory->EnumAdapters(static_cast<UINT>(adapter_info.adapter_names.size()),
+                                              current_adapter.ReleaseAndGetAddressOf())))
   {
     DXGI_ADAPTER_DESC adapter_desc;
     std::string adapter_name;
@@ -701,8 +830,30 @@ std::vector<std::string> D3D11HostDisplay::EnumerateAdapterNames(IDXGIFactory* d
       adapter_name.assign("(Unknown)");
     }
 
+    if (adapter_info.fullscreen_modes.empty())
+    {
+      ComPtr<IDXGIOutput> output;
+      if (SUCCEEDED(current_adapter->EnumOutputs(0, &output)))
+      {
+        UINT num_modes = 0;
+        if (SUCCEEDED(output->GetDisplayModeList(DXGI_FORMAT_R8G8B8A8_UNORM, 0, &num_modes, nullptr)))
+        {
+          std::vector<DXGI_MODE_DESC> modes(num_modes);
+          if (SUCCEEDED(output->GetDisplayModeList(DXGI_FORMAT_R8G8B8A8_UNORM, 0, &num_modes, modes.data())))
+          {
+            for (const DXGI_MODE_DESC& mode : modes)
+            {
+              adapter_info.fullscreen_modes.push_back(StringUtil::StdStringFromFormat(
+                "%u x %u @ %f hz", mode.Width, mode.Height,
+                static_cast<float>(mode.RefreshRate.Numerator) / static_cast<float>(mode.RefreshRate.Denominator)));
+            }
+          }
+        }
+      }
+    }
+
     // handle duplicate adapter names
-    if (std::any_of(adapter_names.begin(), adapter_names.end(),
+    if (std::any_of(adapter_info.adapter_names.begin(), adapter_info.adapter_names.end(),
                     [&adapter_name](const std::string& other) { return (adapter_name == other); }))
     {
       std::string original_adapter_name = std::move(adapter_name);
@@ -712,16 +863,165 @@ std::vector<std::string> D3D11HostDisplay::EnumerateAdapterNames(IDXGIFactory* d
       {
         adapter_name = StringUtil::StdStringFromFormat("%s (%u)", original_adapter_name.c_str(), current_extra);
         current_extra++;
-      } while (std::any_of(adapter_names.begin(), adapter_names.end(),
+      } while (std::any_of(adapter_info.adapter_names.begin(), adapter_info.adapter_names.end(),
                            [&adapter_name](const std::string& other) { return (adapter_name == other); }));
     }
 
-    adapter_names.push_back(std::move(adapter_name));
+    adapter_info.adapter_names.push_back(std::move(adapter_name));
   }
 
-  return adapter_names;
+  return adapter_info;
 }
 
-#endif
+bool D3D11HostDisplay::SetPostProcessingChain(const std::string_view& config)
+{
+  if (config.empty())
+  {
+    m_post_processing_input_texture.Destroy();
+    m_post_processing_stages.clear();
+    m_post_processing_chain.ClearStages();
+    return true;
+  }
+
+  if (!m_post_processing_chain.CreateFromString(config))
+    return false;
+
+  m_post_processing_stages.clear();
+
+  D3D11::ShaderCache shader_cache;
+  shader_cache.Open(g_host_interface->GetShaderCacheBasePath(), m_device->GetFeatureLevel(), SHADER_CACHE_VERSION,
+                    g_settings.gpu_use_debug_device);
+
+  FrontendCommon::PostProcessingShaderGen shadergen(HostDisplay::RenderAPI::D3D11, true);
+  u32 max_ubo_size = 0;
+
+  for (u32 i = 0; i < m_post_processing_chain.GetStageCount(); i++)
+  {
+    const PostProcessingShader& shader = m_post_processing_chain.GetShaderStage(i);
+    const std::string vs = shadergen.GeneratePostProcessingVertexShader(shader);
+    const std::string ps = shadergen.GeneratePostProcessingFragmentShader(shader);
+
+    PostProcessingStage stage;
+    stage.uniforms_size = shader.GetUniformsSize();
+    stage.vertex_shader = shader_cache.GetVertexShader(m_device.Get(), vs);
+    stage.pixel_shader = shader_cache.GetPixelShader(m_device.Get(), ps);
+    if (!stage.vertex_shader || !stage.pixel_shader)
+    {
+      Log_ErrorPrintf("Failed to compile one or more post-processing shaders, disabling.");
+      m_post_processing_stages.clear();
+      m_post_processing_chain.ClearStages();
+      return false;
+    }
+
+    max_ubo_size = std::max(max_ubo_size, stage.uniforms_size);
+    m_post_processing_stages.push_back(std::move(stage));
+  }
+
+  if (m_display_uniform_buffer.GetSize() < max_ubo_size &&
+      !m_display_uniform_buffer.Create(m_device.Get(), D3D11_BIND_CONSTANT_BUFFER, max_ubo_size))
+  {
+    Log_ErrorPrintf("Failed to allocate %u byte constant buffer for postprocessing", max_ubo_size);
+    m_post_processing_stages.clear();
+    m_post_processing_chain.ClearStages();
+    return false;
+  }
+
+  return true;
+}
+
+bool D3D11HostDisplay::CheckPostProcessingRenderTargets(u32 target_width, u32 target_height)
+{
+  DebugAssert(!m_post_processing_stages.empty());
+
+  const DXGI_FORMAT format = DXGI_FORMAT_R8G8B8A8_UNORM;
+  const u32 bind_flags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+
+  if (m_post_processing_input_texture.GetWidth() != target_width ||
+      m_post_processing_input_texture.GetHeight() != target_height)
+  {
+    if (!m_post_processing_input_texture.Create(m_device.Get(), target_width, target_height, 1, 1, format, bind_flags))
+      return false;
+  }
+
+  const u32 target_count = (static_cast<u32>(m_post_processing_stages.size()) - 1);
+  for (u32 i = 0; i < target_count; i++)
+  {
+    PostProcessingStage& pps = m_post_processing_stages[i];
+    if (pps.output_texture.GetWidth() != target_width || pps.output_texture.GetHeight() != target_height)
+    {
+      if (!pps.output_texture.Create(m_device.Get(), target_width, target_height, 1, 1, format, bind_flags))
+        return false;
+    }
+  }
+
+  return true;
+}
+
+void D3D11HostDisplay::ApplyPostProcessingChain(ID3D11RenderTargetView* final_target, s32 final_left, s32 final_top,
+                                                s32 final_width, s32 final_height, void* texture_handle,
+                                                u32 texture_width, s32 texture_height, s32 texture_view_x,
+                                                s32 texture_view_y, s32 texture_view_width, s32 texture_view_height)
+{
+  static constexpr std::array<float, 4> clear_color = {0.0f, 0.0f, 0.0f, 1.0f};
+
+  if (!CheckPostProcessingRenderTargets(GetWindowWidth(), GetWindowHeight()))
+  {
+    RenderDisplay(final_left, final_top, final_width, final_height, texture_handle, texture_width, texture_height,
+                  texture_view_x, texture_view_y, texture_view_width, texture_view_height, m_display_linear_filtering);
+    return;
+  }
+
+  // downsample/upsample - use same viewport for remainder
+  m_context->ClearRenderTargetView(m_post_processing_input_texture.GetD3DRTV(), clear_color.data());
+  m_context->OMSetRenderTargets(1, m_post_processing_input_texture.GetD3DRTVArray(), nullptr);
+  RenderDisplay(final_left, final_top, final_width, final_height, texture_handle, texture_width, texture_height,
+                texture_view_x, texture_view_y, texture_view_width, texture_view_height, m_display_linear_filtering);
+
+  texture_handle = m_post_processing_input_texture.GetD3DSRV();
+  texture_width = m_post_processing_input_texture.GetWidth();
+  texture_height = m_post_processing_input_texture.GetHeight();
+  texture_view_x = final_left;
+  texture_view_y = final_top;
+  texture_view_width = final_width;
+  texture_view_height = final_height;
+
+  const u32 final_stage = static_cast<u32>(m_post_processing_stages.size()) - 1u;
+  for (u32 i = 0; i < static_cast<u32>(m_post_processing_stages.size()); i++)
+  {
+    PostProcessingStage& pps = m_post_processing_stages[i];
+    if (i == final_stage)
+    {
+      m_context->OMSetRenderTargets(1, &final_target, nullptr);
+    }
+    else
+    {
+      m_context->ClearRenderTargetView(pps.output_texture.GetD3DRTV(), clear_color.data());
+      m_context->OMSetRenderTargets(1, pps.output_texture.GetD3DRTVArray(), nullptr);
+    }
+
+    m_context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    m_context->VSSetShader(pps.vertex_shader.Get(), nullptr, 0);
+    m_context->PSSetShader(pps.pixel_shader.Get(), nullptr, 0);
+    m_context->PSSetShaderResources(0, 1, reinterpret_cast<ID3D11ShaderResourceView**>(&texture_handle));
+    m_context->PSSetSamplers(0, 1, m_point_sampler.GetAddressOf());
+
+    const auto map =
+      m_display_uniform_buffer.Map(m_context.Get(), m_display_uniform_buffer.GetSize(), pps.uniforms_size);
+    m_post_processing_chain.GetShaderStage(i).FillUniformBuffer(
+      map.pointer, texture_width, texture_height, texture_view_x, texture_view_y, texture_view_width,
+      texture_view_height, GetWindowWidth(), GetWindowHeight(), 0.0f);
+    m_display_uniform_buffer.Unmap(m_context.Get(), pps.uniforms_size);
+    m_context->VSSetConstantBuffers(0, 1, m_display_uniform_buffer.GetD3DBufferArray());
+    m_context->PSSetConstantBuffers(0, 1, m_display_uniform_buffer.GetD3DBufferArray());
+
+    m_context->Draw(3, 0);
+
+    if (i != final_stage)
+      texture_handle = pps.output_texture.GetD3DSRV();
+  }
+
+  ID3D11ShaderResourceView* null_srv = nullptr;
+  m_context->PSSetShaderResources(0, 1, &null_srv);
+}
 
 } // namespace FrontendCommon

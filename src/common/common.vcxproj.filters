@@ -46,7 +46,6 @@
     <ClInclude Include="string_util.h" />
     <ClInclude Include="md5_digest.h" />
     <ClInclude Include="cpu_detect.h" />
-    <ClInclude Include="cubeb_audio_stream.h" />
     <ClInclude Include="d3d11\shader_cache.h">
       <Filter>d3d11</Filter>
     </ClInclude>
@@ -102,6 +101,13 @@
     <ClInclude Include="minizip_helpers.h" />
     <ClInclude Include="win32_progress_callback.h" />
     <ClInclude Include="make_array.h" />
+    <ClInclude Include="shiftjis.h" />
+    <ClInclude Include="memory_arena.h" />
+    <ClInclude Include="page_fault_handler.h" />
+    <ClInclude Include="thirdparty\StackWalker.h">
+      <Filter>thirdparty</Filter>
+    </ClInclude>
+    <ClInclude Include="crash_handler.h" />
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="jit_code_buffer.cpp" />
@@ -144,7 +150,6 @@
     <ClCompile Include="file_system.cpp" />
     <ClCompile Include="string_util.cpp" />
     <ClCompile Include="md5_digest.cpp" />
-    <ClCompile Include="cubeb_audio_stream.cpp" />
     <ClCompile Include="d3d11\shader_cache.cpp">
       <Filter>d3d11</Filter>
     </ClCompile>
@@ -196,6 +201,13 @@
     <ClCompile Include="cd_image_memory.cpp" />
     <ClCompile Include="minizip_helpers.cpp" />
     <ClCompile Include="win32_progress_callback.cpp" />
+    <ClCompile Include="shiftjis.cpp" />
+    <ClCompile Include="memory_arena.cpp" />
+    <ClCompile Include="page_fault_handler.cpp" />
+    <ClCompile Include="thirdparty\StackWalker.cpp">
+      <Filter>thirdparty</Filter>
+    </ClCompile>
+    <ClCompile Include="crash_handler.cpp" />
   </ItemGroup>
   <ItemGroup>
     <Natvis Include="bitfield.natvis" />
@@ -209,6 +221,9 @@
     </Filter>
     <Filter Include="vulkan">
       <UniqueIdentifier>{642ff5eb-af39-4aab-a42f-6eb8188a11d7}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="thirdparty">
+      <UniqueIdentifier>{fd4150b0-6f82-4251-ab23-34c25fbc5b5e}</UniqueIdentifier>
     </Filter>
   </ItemGroup>
 </Project>

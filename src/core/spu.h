@@ -1,6 +1,7 @@
 #pragma once
 #include "common/bitfield.h"
 #include "common/fifo_queue.h"
+#include "system.h"
 #include "types.h"
 #include <array>
 #include <memory>
@@ -16,10 +17,17 @@ class TimingEvent;
 class SPU
 {
 public:
+  enum : u32
+  {
+    RAM_SIZE = 512 * 1024,
+    RAM_MASK = RAM_SIZE - 1,
+  };
+
   SPU();
   ~SPU();
 
   void Initialize();
+  void CPUClockChanged();
   void Shutdown();
   void Reset();
   bool DoState(StateWrapper& sw);
@@ -45,16 +53,22 @@ public:
   /// Stops dumping audio to file, if started.
   bool StopDumpingAudio();
 
+  /// Access to SPU RAM.
+  const std::array<u8, RAM_SIZE>& GetRAM() const { return m_ram; }
+  std::array<u8, RAM_SIZE>& GetRAM() { return m_ram; }
+
+  /// Change output stream - used for runahead.
+  ALWAYS_INLINE void SetAudioStream(AudioStream* stream) { m_audio_stream = stream; }
+
 private:
-  static constexpr u32 RAM_SIZE = 512 * 1024;
-  static constexpr u32 RAM_MASK = RAM_SIZE - 1;
   static constexpr u32 SPU_BASE = 0x1F801C00;
   static constexpr u32 NUM_VOICES = 24;
   static constexpr u32 NUM_VOICE_REGISTERS = 8;
   static constexpr u32 VOICE_ADDRESS_SHIFT = 3;
   static constexpr u32 NUM_SAMPLES_PER_ADPCM_BLOCK = 28;
+  static constexpr u32 NUM_SAMPLES_FROM_LAST_ADPCM_BLOCK = 3;
   static constexpr u32 SAMPLE_RATE = 44100;
-  static constexpr u32 SYSCLK_TICKS_PER_SPU_TICK = MASTER_CLOCK / SAMPLE_RATE; // 0x300
+  static constexpr u32 SYSCLK_TICKS_PER_SPU_TICK = System::MASTER_CLOCK / SAMPLE_RATE; // 0x300
   static constexpr s16 ENVELOPE_MIN_VOLUME = 0;
   static constexpr s16 ENVELOPE_MAX_VOLUME = 0x7FFF;
   static constexpr u32 CAPTURE_BUFFER_SIZE_PER_CHANNEL = 0x400;
@@ -241,8 +255,8 @@ private:
     VoiceRegisters regs;
     VoiceCounter counter;
     ADPCMFlags current_block_flags;
-    std::array<s16, NUM_SAMPLES_PER_ADPCM_BLOCK> current_block_samples;
-    std::array<s16, 3> previous_block_last_samples;
+    bool is_first_block;
+    std::array<s16, NUM_SAMPLES_FROM_LAST_ADPCM_BLOCK + NUM_SAMPLES_PER_ADPCM_BLOCK> current_block_samples;
     std::array<s16, 2> adpcm_last_samples;
     s32 last_volume;
 
@@ -262,7 +276,6 @@ private:
     void ForceOff();
 
     void DecodeBlock(const ADPCMBlock& block);
-    s16 SampleBlock(s32 index) const;
     s32 Interpolate() const;
 
     // Switches to the specified phase, filling in target.
@@ -292,28 +305,17 @@ private:
         s16 IIR_COEF;
         s16 FB_ALPHA;
         s16 FB_X;
-        u16 IIR_DEST_A0;
-        u16 IIR_DEST_A1;
-        u16 ACC_SRC_A0;
-        u16 ACC_SRC_A1;
-        u16 ACC_SRC_B0;
-        u16 ACC_SRC_B1;
-        u16 IIR_SRC_A0;
-        u16 IIR_SRC_A1;
-        u16 IIR_DEST_B0;
-        u16 IIR_DEST_B1;
-        u16 ACC_SRC_C0;
-        u16 ACC_SRC_C1;
-        u16 ACC_SRC_D0;
-        u16 ACC_SRC_D1;
-        u16 IIR_SRC_B1;
-        u16 IIR_SRC_B0;
-        u16 MIX_DEST_A0;
-        u16 MIX_DEST_A1;
-        u16 MIX_DEST_B0;
-        u16 MIX_DEST_B1;
-        s16 IN_COEF_L;
-        s16 IN_COEF_R;
+        u16 IIR_DEST_A[2];
+        u16 ACC_SRC_A[2];
+        u16 ACC_SRC_B[2];
+        u16 IIR_SRC_A[2];
+        u16 IIR_DEST_B[2];
+        u16 ACC_SRC_C[2];
+        u16 ACC_SRC_D[2];
+        u16 IIR_SRC_B[2];
+        u16 MIX_DEST_A[2];
+        u16 MIX_DEST_B[2];
+        s16 IN_COEF[2];
       };
 
       u16 rev[NUM_REVERB_REGS];
@@ -343,7 +345,11 @@ private:
   u16 ReadVoiceRegister(u32 offset);
   void WriteVoiceRegister(u32 offset, u16 value);
 
-  void CheckRAMIRQ(u32 address);
+  ALWAYS_INLINE bool IsRAMIRQTriggerable() const { return m_SPUCNT.irq9_enable && !m_SPUSTAT.irq9_flag; }
+  ALWAYS_INLINE bool CheckRAMIRQ(u32 address) const { return ((ZeroExtend32(m_irq_address) * 8) == address); }
+  void TriggerRAMIRQ();
+  void CheckForLateRAMIRQs();
+
   void WriteToCaptureBuffer(u32 index, s16 value);
   void IncrementCaptureBufferPosition();
 
@@ -355,12 +361,13 @@ private:
   u32 ReverbMemoryAddress(u32 address) const;
   s16 ReverbRead(u32 address, s32 offset = 0);
   void ReverbWrite(u32 address, s16 data);
-  void ComputeReverb();
   void ProcessReverb(s16 left_in, s16 right_in, s32* left_out, s32* right_out);
 
   void Execute(TickCount ticks);
   void UpdateEventInterval();
 
+  void ExecuteFIFOWriteToRAM(TickCount& ticks);
+  void ExecuteFIFOReadFromRAM(TickCount& ticks);
   void ExecuteTransfer(TickCount ticks);
   void ManualTransferWrite(u16 value);
   void UpdateTransferEvent();
@@ -369,7 +376,10 @@ private:
   std::unique_ptr<TimingEvent> m_tick_event;
   std::unique_ptr<TimingEvent> m_transfer_event;
   std::unique_ptr<Common::WAVWriter> m_dump_writer;
+  AudioStream* m_audio_stream = nullptr;
   TickCount m_ticks_carry = 0;
+  TickCount m_cpu_ticks_per_spu_tick = 0;
+  TickCount m_cpu_tick_divider = 0;
 
   SPUCNT m_SPUCNT = {};
   SPUSTAT m_SPUSTAT = {};

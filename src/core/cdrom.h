@@ -27,9 +27,13 @@ public:
 
   bool HasMedia() const { return m_reader.HasMedia(); }
   const std::string& GetMediaFileName() const { return m_reader.GetMediaFileName(); }
+  bool IsMediaPS1Disc() const;
+  bool DoesMediaRegionMatchConsole() const;
 
   void InsertMedia(std::unique_ptr<CDImage> media);
   std::unique_ptr<CDImage> RemoveMedia(bool force = false);
+
+  void CPUClockChanged();
 
   // I/O
   u8 ReadRegister(u32 offset);
@@ -64,9 +68,12 @@ private:
     DATA_FIFO_SIZE = RAW_SECTOR_OUTPUT_SIZE,
     NUM_SECTOR_BUFFERS = 8,
     AUDIO_FIFO_SIZE = 44100 * 2,
-    AUDIO_FIFO_LOW_WATERMARK = 5,
+    AUDIO_FIFO_LOW_WATERMARK = 10,
 
     BASE_RESET_TICKS = 400000,
+
+    MAX_FAST_FORWARD_RATE = 12,
+    FAST_FORWARD_RATE_STEP = 4
   };
 
   static constexpr u8 INTERRUPT_REGISTER_MASK = 0x1F;
@@ -247,7 +254,7 @@ private:
   void UpdateCommandEvent();
   void ExecuteDrive(TickCount ticks_late);
   void BeginReading(TickCount ticks_late = 0, bool after_seek = false);
-  void BeginPlaying(u8 track_bcd, TickCount ticks_late = 0, bool after_seek = false);
+  void BeginPlaying(u8 track, TickCount ticks_late = 0, bool after_seek = false);
   void DoShellOpenComplete(TickCount ticks_late);
   void DoResetComplete(TickCount ticks_late);
   void DoSeekComplete(TickCount ticks_late);
@@ -312,6 +319,7 @@ private:
   u8 m_last_cdda_report_frame_nibble = 0xFF;
   u8 m_play_track_number_bcd = 0xFF;
   u8 m_async_command_parameter = 0x00;
+  s8 m_fast_forward_rate = 0;
 
   std::array<std::array<u8, 2>, 2> m_cd_audio_volume_matrix{};
   std::array<std::array<u8, 2>, 2> m_next_cd_audio_volume_matrix{};

@@ -5,7 +5,9 @@
 #include "dma.h"
 #include "interrupt_controller.h"
 #include "system.h"
-#include <imgui.h>
+#ifdef WITH_IMGUI
+#include "imgui.h"
+#endif
 Log_SetChannel(MDEC);
 
 MDEC g_mdec;
@@ -16,8 +18,9 @@ MDEC::~MDEC() = default;
 
 void MDEC::Initialize()
 {
-  m_block_copy_out_event = TimingEvents::CreateTimingEvent("MDEC Block Copy Out", TICKS_PER_BLOCK, TICKS_PER_BLOCK,
-                                                           std::bind(&MDEC::CopyOutBlock, this), false);
+  m_block_copy_out_event = TimingEvents::CreateTimingEvent(
+    "MDEC Block Copy Out", 1, 1,
+    [](void* param, TickCount ticks, TickCount ticks_late) { static_cast<MDEC*>(param)->CopyOutBlock(); }, this, false);
   m_total_blocks_decoded = 0;
   Reset();
 }
@@ -268,9 +271,9 @@ void MDEC::Execute()
             break;
 
           default:
-            Panic("Unknown command");
-            num_words = 0;
-            new_state = State::Idle;
+            Log_DevPrintf("Invalid MDEC command 0x%08X", cw.bits);
+            num_words = cw.parameter_word_count.GetValue();
+            new_state = State::NoCommand;
             break;
         }
 
@@ -332,6 +335,20 @@ void MDEC::Execute()
         continue;
       }
 
+      case State::NoCommand:
+      {
+        // can potentially have a large amount of halfwords, so eat them as we go
+        const u32 words_to_consume = std::min(m_remaining_halfwords, m_data_in_fifo.GetSize());
+        m_data_in_fifo.Remove(words_to_consume);
+        m_remaining_halfwords -= words_to_consume;
+        if (m_remaining_halfwords == 0)
+          goto finished;
+
+        m_state = State::Idle;
+        UpdateStatus();
+        continue;
+      }
+
       default:
         UnreachableCode();
         return;
@@ -351,6 +368,14 @@ bool MDEC::HandleDecodeMacroblockCommand()
     return DecodeColoredMacroblock();
 }
 
+// Parasite Eve needs slightly higher timing in 16bpp mode, Disney's Treasure Planet needs lower timing in 24bpp mode.
+static constexpr std::array<TickCount, 4> s_ticks_per_block = {{
+  448, // 4bpp
+  448, // 8bpp
+  448, // 24bpp
+  550, // 16bpp
+}};
+
 bool MDEC::DecodeMonoMacroblock()
 {
   // TODO: This should guard the output not the input
@@ -368,7 +393,7 @@ bool MDEC::DecodeMonoMacroblock()
 
   y_to_mono(m_blocks[0]);
 
-  ScheduleBlockCopyOut(TICKS_PER_BLOCK);
+  ScheduleBlockCopyOut(s_ticks_per_block[static_cast<u8>(m_status.data_output_depth)] * 6);
 
   m_total_blocks_decoded++;
   return true;
@@ -398,7 +423,7 @@ bool MDEC::DecodeColoredMacroblock()
   yuv_to_rgb(8, 8, m_blocks[0], m_blocks[1], m_blocks[5]);
   m_total_blocks_decoded += 4;
 
-  ScheduleBlockCopyOut(TICKS_PER_BLOCK * 6);
+  ScheduleBlockCopyOut(s_ticks_per_block[static_cast<u8>(m_status.data_output_depth)] * 6);
   return true;
 }
 
@@ -407,7 +432,7 @@ void MDEC::ScheduleBlockCopyOut(TickCount ticks)
   DebugAssert(!HasPendingBlockCopyOut());
   Log_DebugPrintf("Scheduling block copy out in %d ticks", ticks);
 
-  m_block_copy_out_event->Schedule(ticks);
+  m_block_copy_out_event->SetIntervalAndSchedule(ticks);
 }
 
 void MDEC::CopyOutBlock()
@@ -522,10 +547,6 @@ void MDEC::CopyOutBlock()
   Execute();
 }
 
-static constexpr std::array<u8, 64> zigzag = {{0,  1,  5,  6,  14, 15, 27, 28, 2,  4,  7,  13, 16, 26, 29, 42,
-                                               3,  8,  12, 17, 25, 30, 41, 43, 9,  11, 18, 24, 31, 40, 44, 53,
-                                               10, 19, 23, 32, 39, 45, 52, 54, 20, 22, 33, 38, 46, 51, 55, 60,
-                                               21, 34, 37, 47, 50, 56, 59, 61, 35, 36, 48, 49, 57, 58, 62, 63}};
 static constexpr std::array<u8, 64> zagzig = {{0,  1,  8,  16, 9,  2,  3,  10, 17, 24, 32, 25, 18, 11, 4,  5,
                                                12, 19, 26, 33, 40, 48, 41, 34, 27, 20, 13, 6,  7,  14, 21, 28,
                                                35, 42, 49, 56, 57, 50, 43, 36, 29, 22, 15, 23, 30, 37, 44, 51,
@@ -701,6 +722,7 @@ void MDEC::HandleSetScaleCommand()
 
 void MDEC::DrawDebugStateWindow()
 {
+#ifdef WITH_IMGUI
   const float framebuffer_scale = ImGui::GetIO().DisplayFramebufferScale.x;
 
   ImGui::SetNextWindowSize(ImVec2(300.0f * framebuffer_scale, 350.0f * framebuffer_scale), ImGuiCond_FirstUseEver);
@@ -738,4 +760,5 @@ void MDEC::DrawDebugStateWindow()
   }
 
   ImGui::End();
+#endif
 }

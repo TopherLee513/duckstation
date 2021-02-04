@@ -4,6 +4,7 @@
 #include <cstdarg>
 #include <cstring>
 #include <limits>
+#include <string>
 #include <string_view>
 
 //
@@ -54,12 +55,17 @@ public:
   // Construct a string from a data object, does not increment the reference count on the string data, use carefully.
   explicit String(StringData* pStringData) : m_pStringData(pStringData) {}
 
+  // Creates string from string_view.
+  String(const std::string_view& sv);
+
   // Destructor. Child classes may not have any destructors, as this is not virtual.
   ~String();
 
   // manual assignment
   void Assign(const String& copyString);
   void Assign(const char* copyText);
+  void Assign(const std::string& copyString);
+  void Assign(const std::string_view& copyString);
   void Assign(String&& moveString);
 
   // assignment but ensures that we have our own copy.
@@ -87,6 +93,8 @@ public:
   void AppendString(const String& appendStr);
   void AppendString(const char* appendText);
   void AppendString(const char* appendString, u32 Count);
+  void AppendString(const std::string& appendString);
+  void AppendString(const std::string_view& appendString);
 
   // append a substring of the specified string to this string
   void AppendSubString(const String& appendStr, s32 Offset = 0, s32 Count = std::numeric_limits<s32>::max());
@@ -103,6 +111,8 @@ public:
   void PrependString(const String& appendStr);
   void PrependString(const char* appendText);
   void PrependString(const char* appendString, u32 Count);
+  void PrependString(const std::string& appendStr);
+  void PrependString(const std::string_view& appendStr);
 
   // append a substring of the specified string to this string
   void PrependSubString(const String& appendStr, s32 Offset = 0, s32 Count = std::numeric_limits<s32>::max());
@@ -116,6 +126,8 @@ public:
   void InsertString(s32 offset, const String& appendStr);
   void InsertString(s32 offset, const char* appendStr);
   void InsertString(s32 offset, const char* appendStr, u32 appendStrLength);
+  void InsertString(s32 offset, const std::string& appendStr);
+  void InsertString(s32 offset, const std::string_view& appendStr);
 
   // set to formatted string
   void Format(const char* FormatString, ...);
@@ -240,6 +252,16 @@ public:
     Assign(Text);
     return *this;
   }
+  String& operator=(const std::string& Text)
+  {
+    Assign(Text);
+    return *this;
+  }
+  String& operator=(const std::string_view& Text)
+  {
+    Assign(Text);
+    return *this;
+  }
 
   // Move operator.
   String& operator=(String&& moveString)
@@ -307,6 +329,12 @@ public:
     Assign(copyString.GetCharArray());
   }
 
+  StackString(const std::string_view& sv) : String(&m_sStringData)
+  {
+    InitStackStringData();
+    AppendString(sv.data(), static_cast<u32>(sv.size()));
+  }
+
   // Override the fromstring method
   static StackString FromFormat(const char* FormatString, ...)
   {
@@ -335,6 +363,16 @@ public:
 
   // Allocates own buffer and copies text.
   StackString& operator=(const char* Text)
+  {
+    Assign(Text);
+    return *this;
+  }
+  StackString& operator=(const std::string& Text)
+  {
+    Assign(Text);
+    return *this;
+  }
+  StackString& operator=(const std::string_view& Text)
   {
     Assign(Text);
     return *this;

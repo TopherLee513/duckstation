@@ -4,15 +4,26 @@ The following people have contributed to the project in some way, and are credit
 ## Code Contributions
 - Connor McLaughlin - @stenzek
 - @ggrtk
+- @CookiePLMonster
 
 ## Translators
 - Anderson Cardoso - Portuguese (Br)
 - @bajolzas - Portuguese (Pt)
-- posix - @Richard-L - German
-- @phoe-nix - Chinese (Simplified)
+- posix - @Richard-L, blexx - German
+- @phoe-nix, @zkdpower - Chinese (Simplified)
 - Sorer - @MojoJojoDojo - Hebrew
-- Hipnosis183 - Spanish
+- Hipnosis - @Hipnosis183, MrHomunculus, @falsepopsky - Spanish
 - @RaydenX93 - Italian
+- @r57zone - Russian
+- @6lackmag3 - Russian (Android)
+- @DenSinH - Dutch
+- @BenjaminSiskoo - French
+- mikakunin - Japanese
+- Zuzia, Seba - Polish
+
+## Cheat Database
+- Pugsy
+- Unicorngoulash
 
 ## Game Compatibility Database
  - @Zet-sensei
@@ -29,6 +40,18 @@ The following people have contributed to the project in some way, and are credit
  - @heckez-sys
  - @Damaniel
  - @RaydenX93
+ - @gp2man
+ - @Richard-L
+ - @pan2marumie3
+ - @CookiePLMonster
+ - @LoStraniero91
+ - @JFD62780
+ - @lmarciano9
+ - @Facepalm38
+ - @Alien-Grey
+ - @dmlipat
+ - @Krusher97
+ - @AngryScotsmanGaming
 
 ## Special Thanks
 The following people did not directly contribute to the emulator, but it would not be in the state if not for them.

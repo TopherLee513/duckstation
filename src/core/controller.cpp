@@ -1,5 +1,6 @@
 #include "controller.h"
 #include "analog_controller.h"
+#include "analog_joystick.h"
 #include "common/state_wrapper.h"
 #include "digital_controller.h"
 #include "namco_guncon.h"
@@ -12,7 +13,7 @@ Controller::~Controller() = default;
 
 void Controller::Reset() {}
 
-bool Controller::DoState(StateWrapper& sw)
+bool Controller::DoState(StateWrapper& sw, bool apply_input_state)
 {
   return !sw.HasError();
 }
@@ -29,6 +30,16 @@ void Controller::SetAxisState(s32 axis_code, float value) {}
 
 void Controller::SetButtonState(s32 button_code, bool pressed) {}
 
+u32 Controller::GetButtonStateBits() const
+{
+  return 0;
+}
+
+std::optional<u32> Controller::GetAnalogInputBytes() const
+{
+  return std::nullopt;
+}
+
 u32 Controller::GetVibrationMotorCount() const
 {
   return 0;
@@ -41,7 +52,7 @@ float Controller::GetVibrationMotorStrength(u32 motor)
 
 void Controller::LoadSettings(const char* section) {}
 
-bool Controller::GetSoftwareCursor(const Common::RGBA8Image** image, float* image_scale)
+bool Controller::GetSoftwareCursor(const Common::RGBA8Image** image, float* image_scale, bool* relative_mode)
 {
   return false;
 }
@@ -55,6 +66,9 @@ std::unique_ptr<Controller> Controller::Create(ControllerType type, u32 index)
 
     case ControllerType::AnalogController:
       return AnalogController::Create(index);
+
+    case ControllerType::AnalogJoystick:
+      return AnalogJoystick::Create(index);
 
     case ControllerType::NamcoGunCon:
       return NamcoGunCon::Create();
@@ -91,6 +105,9 @@ Controller::AxisList Controller::GetAxisNames(ControllerType type)
     case ControllerType::AnalogController:
       return AnalogController::StaticGetAxisNames();
 
+    case ControllerType::AnalogJoystick:
+      return AnalogJoystick::StaticGetAxisNames();
+
     case ControllerType::NamcoGunCon:
       return NamcoGunCon::StaticGetAxisNames();
 
@@ -115,6 +132,9 @@ Controller::ButtonList Controller::GetButtonNames(ControllerType type)
 
     case ControllerType::AnalogController:
       return AnalogController::StaticGetButtonNames();
+
+    case ControllerType::AnalogJoystick:
+      return AnalogJoystick::StaticGetButtonNames();
 
     case ControllerType::NamcoGunCon:
       return NamcoGunCon::StaticGetButtonNames();
@@ -141,6 +161,9 @@ u32 Controller::GetVibrationMotorCount(ControllerType type)
     case ControllerType::AnalogController:
       return AnalogController::StaticGetVibrationMotorCount();
 
+    case ControllerType::AnalogJoystick:
+      return AnalogJoystick::StaticGetVibrationMotorCount();
+
     case ControllerType::NamcoGunCon:
       return NamcoGunCon::StaticGetVibrationMotorCount();
 
@@ -165,6 +188,9 @@ std::optional<s32> Controller::GetAxisCodeByName(ControllerType type, std::strin
 
     case ControllerType::AnalogController:
       return AnalogController::StaticGetAxisCodeByName(axis_name);
+
+    case ControllerType::AnalogJoystick:
+      return AnalogJoystick::StaticGetAxisCodeByName(axis_name);
 
     case ControllerType::NamcoGunCon:
       return NamcoGunCon::StaticGetAxisCodeByName(axis_name);
@@ -191,6 +217,9 @@ std::optional<s32> Controller::GetButtonCodeByName(ControllerType type, std::str
     case ControllerType::AnalogController:
       return AnalogController::StaticGetButtonCodeByName(button_name);
 
+    case ControllerType::AnalogJoystick:
+      return AnalogJoystick::StaticGetButtonCodeByName(button_name);
+
     case ControllerType::NamcoGunCon:
       return NamcoGunCon::StaticGetButtonCodeByName(button_name);
 
@@ -210,11 +239,23 @@ Controller::SettingList Controller::GetSettings(ControllerType type)
 {
   switch (type)
   {
+    case ControllerType::DigitalController:
+      return DigitalController::StaticGetSettings();
+
     case ControllerType::AnalogController:
       return AnalogController::StaticGetSettings();
 
+    case ControllerType::AnalogJoystick:
+      return AnalogJoystick::StaticGetSettings();
+
     case ControllerType::NamcoGunCon:
       return NamcoGunCon::StaticGetSettings();
+
+    case ControllerType::NeGcon:
+      return NeGcon::StaticGetSettings();
+
+    case ControllerType::PlayStationMouse:
+      return PlayStationMouse::StaticGetSettings();
 
     default:
       return {};

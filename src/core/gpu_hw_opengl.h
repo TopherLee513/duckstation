@@ -5,6 +5,7 @@
 #include "common/gl/texture.h"
 #include "glad.h"
 #include "gpu_hw.h"
+#include "texture_replacements.h"
 #include <array>
 #include <memory>
 #include <tuple>
@@ -16,7 +17,8 @@ public:
   ~GPU_HW_OpenGL() override;
 
   bool Initialize(HostDisplay* host_display) override;
-  void Reset() override;
+  void Reset(bool clear_vram) override;
+  bool DoState(StateWrapper& sw, HostDisplayTexture** host_texture, bool update_display) override;
 
   void ResetGraphicsAPIState() override;
   void RestoreGraphicsAPIState() override;
@@ -27,10 +29,11 @@ protected:
   void UpdateDisplay() override;
   void ReadVRAM(u32 x, u32 y, u32 width, u32 height) override;
   void FillVRAM(u32 x, u32 y, u32 width, u32 height, u32 color) override;
-  void UpdateVRAM(u32 x, u32 y, u32 width, u32 height, const void* data) override;
+  void UpdateVRAM(u32 x, u32 y, u32 width, u32 height, const void* data, bool set_mask, bool check_mask) override;
   void CopyVRAM(u32 src_x, u32 src_y, u32 dst_x, u32 dst_y, u32 width, u32 height) override;
   void UpdateVRAMReadTexture() override;
   void UpdateDepthBufferFromMaskBit() override;
+  void ClearDepthBuffer() override;
   void SetScissorFromDrawingArea() override;
   void MapBatchVertexPointer(u32 required_vertices) override;
   void UnmapBatchVertexPointer(u32 used_vertices) override;
@@ -55,6 +58,8 @@ private:
   void SetCapabilities(HostDisplay* host_display);
   bool CreateFramebuffer();
   void ClearFramebuffer();
+  void CopyFramebufferForState(GLenum target, GLuint src_texture, u32 src_fbo, u32 src_x, u32 src_y, GLuint dst_texture,
+                               u32 dst_fbo, u32 dst_x, u32 dst_y, u32 width, u32 height);
 
   bool CreateVertexBuffer();
   bool CreateUniformBuffer();
@@ -62,7 +67,13 @@ private:
 
   bool CompilePrograms();
 
-  GL::ShaderCache m_shader_cache;
+  void SetDepthFunc();
+  void SetDepthFunc(GLenum func);
+  void SetBlendMode();
+
+  bool BlitVRAMReplacementTexture(const TextureReplacementTexture* tex, u32 dst_x, u32 dst_y, u32 width, u32 height);
+  void DownsampleFramebuffer(GL::Texture& source, u32 left, u32 top, u32 width, u32 height);
+  void DownsampleFramebufferBoxFilter(GL::Texture& source, u32 left, u32 top, u32 width, u32 height);
 
   // downsample texture - used for readbacks at >1xIR.
   GL::Texture m_vram_texture;
@@ -70,11 +81,13 @@ private:
   GL::Texture m_vram_read_texture;
   GL::Texture m_vram_encoding_texture;
   GL::Texture m_display_texture;
+  GL::Texture m_vram_write_replacement_texture;
 
   std::unique_ptr<GL::StreamBuffer> m_vertex_stream_buffer;
   GLuint m_vram_fbo_id = 0;
   GLuint m_vao_id = 0;
   GLuint m_attributeless_vao_id = 0;
+  GLuint m_state_copy_fbo_id = 0;
 
   std::unique_ptr<GL::StreamBuffer> m_uniform_stream_buffer;
 
@@ -96,4 +109,11 @@ private:
   bool m_supports_texture_buffer = false;
   bool m_supports_geometry_shaders = false;
   bool m_use_ssbo_for_vram_writes = false;
+
+  GLenum m_current_depth_test = 0;
+  GPUTransparencyMode m_current_transparency_mode = GPUTransparencyMode::Disabled;
+  BatchRenderMode m_current_render_mode = BatchRenderMode::TransparencyDisabled;
+
+  GL::Texture m_downsample_texture;
+  GL::Program m_downsample_program;
 };

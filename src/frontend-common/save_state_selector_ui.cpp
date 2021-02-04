@@ -31,6 +31,7 @@ void SaveStateSelectorUI::Close()
     return;
 
   m_open = false;
+  ClearList();
 }
 
 void SaveStateSelectorUI::ClearList()
@@ -44,7 +45,7 @@ void SaveStateSelectorUI::RefreshList()
 
   if (!System::GetRunningCode().empty())
   {
-    for (s32 i = 1; i <= CommonHostInterface::GLOBAL_SAVE_STATE_SLOTS; i++)
+    for (s32 i = 1; i <= CommonHostInterface::PER_GAME_SAVE_STATE_SLOTS; i++)
     {
       std::optional<CommonHostInterface::ExtendedSaveStateInfo> ssi =
         m_host_interface->GetExtendedSaveStateInfo(System::GetRunningCode().c_str(), i);
@@ -130,19 +131,29 @@ void SaveStateSelectorUI::InitializeListEntry(ListEntry* li, CommonHostInterface
   li->preview_texture.reset();
   if (ssi && !ssi->screenshot_data.empty())
   {
-    li->preview_texture = m_host_interface->GetDisplay()->CreateTexture(ssi->screenshot_width, ssi->screenshot_height,
-                                                                        ssi->screenshot_data.data(),
-                                                                        sizeof(u32) * ssi->screenshot_width, false);
+    li->preview_texture = m_host_interface->GetDisplay()->CreateTexture(
+      ssi->screenshot_width, ssi->screenshot_height, 1, 1, 1, HostDisplayPixelFormat::RGBA8,
+      ssi->screenshot_data.data(), sizeof(u32) * ssi->screenshot_width, false);
   }
   else
   {
-    li->preview_texture =
-      m_host_interface->GetDisplay()->CreateTexture(PLACEHOLDER_ICON_WIDTH, PLACEHOLDER_ICON_HEIGHT,
-                                                    PLACEHOLDER_ICON_DATA, sizeof(u32) * PLACEHOLDER_ICON_WIDTH, false);
+    li->preview_texture = m_host_interface->GetDisplay()->CreateTexture(
+      PLACEHOLDER_ICON_WIDTH, PLACEHOLDER_ICON_HEIGHT, 1, 1, 1, HostDisplayPixelFormat::RGBA8, PLACEHOLDER_ICON_DATA,
+      sizeof(u32) * PLACEHOLDER_ICON_WIDTH, false);
   }
 
   if (!li->preview_texture)
     Log_ErrorPrintf("Failed to upload save state image to GPU");
+}
+
+std::pair<s32, bool> SaveStateSelectorUI::GetSlotTypeFromSelection(u32 selection) const
+{
+  if (selection < CommonHostInterface::PER_GAME_SAVE_STATE_SLOTS)
+  {
+    return {selection + 1, false};
+  }
+
+  return {selection - CommonHostInterface::PER_GAME_SAVE_STATE_SLOTS + 1, true};
 }
 
 void SaveStateSelectorUI::InitializePlaceholderListEntry(ListEntry* li, s32 slot, bool global)
@@ -154,9 +165,9 @@ void SaveStateSelectorUI::InitializePlaceholderListEntry(ListEntry* li, s32 slot
   li->slot = slot;
   li->global = global;
 
-  li->preview_texture =
-    m_host_interface->GetDisplay()->CreateTexture(PLACEHOLDER_ICON_WIDTH, PLACEHOLDER_ICON_HEIGHT,
-                                                  PLACEHOLDER_ICON_DATA, sizeof(u32) * PLACEHOLDER_ICON_WIDTH, false);
+  li->preview_texture = m_host_interface->GetDisplay()->CreateTexture(
+    PLACEHOLDER_ICON_WIDTH, PLACEHOLDER_ICON_HEIGHT, 1, 1, 1, HostDisplayPixelFormat::RGBA8, PLACEHOLDER_ICON_DATA,
+    sizeof(u32) * PLACEHOLDER_ICON_WIDTH, false);
 
   if (!li->preview_texture)
     Log_ErrorPrintf("Failed to upload save state image to GPU");
@@ -230,27 +241,15 @@ void SaveStateSelectorUI::Draw()
 
 void SaveStateSelectorUI::LoadCurrentSlot()
 {
-  if (m_current_selection >= m_slots.size())
-  {
-    RefreshList();
-    return;
-  }
-
-  const ListEntry& le = m_slots.at(m_current_selection);
-  m_host_interface->LoadState(le.global, le.slot);
+  const auto slot_info = GetSlotTypeFromSelection(m_current_selection);
+  m_host_interface->LoadState(slot_info.second, slot_info.first);
   Close();
 }
 
 void SaveStateSelectorUI::SaveCurrentSlot()
 {
-  if (m_current_selection >= m_slots.size())
-  {
-    RefreshList();
-    return;
-  }
-
-  const ListEntry& le = m_slots.at(m_current_selection);
-  m_host_interface->SaveState(le.global, le.slot);
+  const auto slot_info = GetSlotTypeFromSelection(m_current_selection);
+  m_host_interface->SaveState(slot_info.second, slot_info.first);
   Close();
 }
 

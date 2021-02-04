@@ -2,6 +2,7 @@
 #include "common/assert.h"
 #include "common/state_wrapper.h"
 #include "host_interface.h"
+#include "system.h"
 
 DigitalController::DigitalController() = default;
 
@@ -27,12 +28,16 @@ void DigitalController::Reset()
   m_transfer_state = TransferState::Idle;
 }
 
-bool DigitalController::DoState(StateWrapper& sw)
+bool DigitalController::DoState(StateWrapper& sw, bool apply_input_state)
 {
-  if (!Controller::DoState(sw))
+  if (!Controller::DoState(sw, apply_input_state))
     return false;
 
-  sw.Do(&m_button_state);
+  u16 button_state = m_button_state;
+  sw.Do(&button_state);
+  if (apply_input_state)
+    m_button_state = apply_input_state;
+
   sw.Do(&m_transfer_state);
   return true;
 }
@@ -41,10 +46,21 @@ void DigitalController::SetAxisState(s32 axis_code, float value) {}
 
 void DigitalController::SetButtonState(Button button, bool pressed)
 {
+  const u16 bit = u16(1) << static_cast<u8>(button);
   if (pressed)
-    m_button_state &= ~(u16(1) << static_cast<u8>(button));
+  {
+    if (m_button_state & bit)
+      System::SetRunaheadReplayFlag();
+
+    m_button_state &= ~bit;
+  }
   else
-    m_button_state |= u16(1) << static_cast<u8>(button);
+  {
+    if (!(m_button_state & bit))
+      System::SetRunaheadReplayFlag();
+
+    m_button_state |= bit;
+  }
 }
 
 void DigitalController::SetButtonState(s32 button_code, bool pressed)
@@ -53,6 +69,11 @@ void DigitalController::SetButtonState(s32 button_code, bool pressed)
     return;
 
   SetButtonState(static_cast<Button>(button_code), pressed);
+}
+
+u32 DigitalController::GetButtonStateBits() const
+{
+  return m_button_state ^ 0xFFFF;
 }
 
 void DigitalController::ResetTransferState()
@@ -91,7 +112,7 @@ bool DigitalController::Transfer(const u8 data_in, u8* data_out)
 
     case TransferState::ButtonsLSB:
     {
-      *data_out = Truncate8(m_button_state);
+      *data_out = Truncate8(m_button_state) & GetButtonsLSBMask();
       m_transfer_state = TransferState::ButtonsMSB;
       return true;
     }
@@ -175,4 +196,27 @@ Controller::ButtonList DigitalController::StaticGetButtonNames()
 u32 DigitalController::StaticGetVibrationMotorCount()
 {
   return 0;
+}
+
+Controller::SettingList DigitalController::StaticGetSettings()
+{
+  static constexpr std::array<SettingInfo, 1> settings = {
+    {{SettingInfo::Type::Boolean, "ForcePopnControllerMode",
+      TRANSLATABLE("DigitalController", "Force Pop'n Controller Mode"),
+      TRANSLATABLE("DigitalController", "Forces the Digital Controller to act as a Pop'n Controller."), "false"}}};
+  return SettingList(settings.begin(), settings.end());
+}
+
+void DigitalController::LoadSettings(const char* section)
+{
+  Controller::LoadSettings(section);
+  m_popn_controller_mode = g_host_interface->GetBoolSettingValue(section, "ForcePopnControllerMode", false);
+}
+
+u8 DigitalController::GetButtonsLSBMask() const
+{
+  constexpr u8 popn_controller_mask =
+    static_cast<u8>(~(u8(1) << static_cast<u8>(Button::Right) | u8(1) << static_cast<u8>(Button::Down) |
+                      u8(1) << static_cast<u8>(Button::Left)));
+  return m_popn_controller_mode ? popn_controller_mask : 0xFF;
 }

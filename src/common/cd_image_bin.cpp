@@ -14,6 +14,7 @@ public:
   bool Open(const char* filename);
 
   bool ReadSubChannelQ(SubChannelQ* subq) override;
+  bool HasNonStandardSubchannel() const override;
 
 protected:
   bool ReadSectorFromIndex(void* buffer, const Index& index, LBA lba_in_index) override;
@@ -24,17 +25,6 @@ private:
 
   CDSubChannelReplacement m_sbi;
 };
-
-static std::string ReplaceExtension(std::string_view path, std::string_view new_extension)
-{
-  std::string_view::size_type pos = path.rfind('.');
-  if (pos == std::string::npos)
-    return std::string(path);
-
-  std::string ret(path, 0, pos + 1);
-  ret.append(new_extension);
-  return ret;
-}
 
 CDImageBin::CDImageBin() = default;
 
@@ -101,7 +91,7 @@ bool CDImageBin::Open(const char* filename)
 
   AddLeadOutIndex();
 
-  m_sbi.LoadSBI(ReplaceExtension(filename, "sbi").c_str());
+  m_sbi.LoadSBI(FileSystem::ReplaceExtension(filename, "sbi").c_str());
 
   return Seek(1, Position{0, 0, 0});
 }
@@ -112,6 +102,11 @@ bool CDImageBin::ReadSubChannelQ(SubChannelQ* subq)
     return true;
 
   return CDImage::ReadSubChannelQ(subq);
+}
+
+bool CDImageBin::HasNonStandardSubchannel() const
+{
+  return (m_sbi.GetReplacementSectorCount() > 0);
 }
 
 bool CDImageBin::ReadSectorFromIndex(void* buffer, const Index& index, LBA lba_in_index)

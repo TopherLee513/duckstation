@@ -22,17 +22,17 @@ public:
   void ClearBindings() override;
 
   // Binding to events. If a binding for this axis/button already exists, returns false.
-  bool BindControllerAxis(int controller_index, int axis_number, AxisCallback callback) override;
+  bool BindControllerAxis(int controller_index, int axis_number, AxisSide axis_side, AxisCallback callback) override;
   bool BindControllerButton(int controller_index, int button_number, ButtonCallback callback) override;
   bool BindControllerAxisToButton(int controller_index, int axis_number, bool direction,
                                   ButtonCallback callback) override;
+  bool BindControllerHatToButton(int controller_index, int hat_number, std::string_view hat_position,
+                                 ButtonCallback callback) override;
+  bool BindControllerButtonToAxis(int controller_index, int button_number, AxisCallback callback) override;
 
   // Changing rumble strength.
   u32 GetControllerRumbleMotorCount(int controller_index) override;
   void SetControllerRumbleStrength(int controller_index, const float* strengths, u32 num_motors) override;
-
-  // Set scaling that will be applied on axis-to-axis mappings
-  bool SetControllerAxisScale(int controller_index, float scale = 1.00f) override;
 
   // Set deadzone that will be applied on axis-to-button mappings
   bool SetControllerDeadzone(int controller_index, float size = 0.25f) override;
@@ -61,13 +61,12 @@ private:
     XINPUT_STATE last_state = {};
     bool connected = false;
 
-    // Scaling value of 1.30f to 1.40f recommended when using recent controllers
-    float axis_scale = 1.00f;
     float deadzone = 0.25f;
 
-    std::array<AxisCallback, MAX_NUM_AXISES> axis_mapping;
+    std::array<std::array<AxisCallback, 3>, MAX_NUM_AXISES> axis_mapping;
     std::array<ButtonCallback, MAX_NUM_BUTTONS> button_mapping;
     std::array<std::array<ButtonCallback, 2>, MAX_NUM_AXISES> axis_button_mapping;
+    std::array<AxisCallback, MAX_NUM_BUTTONS> button_axis_mapping;
   };
 
   using ControllerDataArray = std::array<ControllerData, XUSER_MAX_COUNT>;

@@ -4,12 +4,17 @@
 #include "common/log.h"
 #include "common/state_wrapper.h"
 #include "common/string_util.h"
+#include "cpu_code_cache.h"
 #include "cpu_core.h"
 #include "gpu.h"
 #include "interrupt_controller.h"
 #include "mdec.h"
+#include "pad.h"
 #include "spu.h"
 #include "system.h"
+#ifdef WITH_IMGUI
+#include "imgui.h"
+#endif
 Log_SetChannel(DMA);
 
 DMA g_dma;
@@ -24,18 +29,27 @@ void DMA::Initialize()
   m_halt_ticks = g_settings.dma_halt_ticks;
 
   m_transfer_buffer.resize(32);
-  m_unhalt_event = TimingEvents::CreateTimingEvent("DMA Transfer Unhalt", 1, m_max_slice_ticks,
-                                                   std::bind(&DMA::UnhaltTransfer, this, std::placeholders::_1), false);
+  m_unhalt_event = TimingEvents::CreateTimingEvent(
+    "DMA Transfer Unhalt", 1, m_max_slice_ticks,
+    [](void* param, TickCount ticks, TickCount ticks_late) { static_cast<DMA*>(param)->UnhaltTransfer(ticks); }, this,
+    false);
 
   Reset();
 }
 
 void DMA::Shutdown()
 {
+  ClearState();
   m_unhalt_event.reset();
 }
 
 void DMA::Reset()
+{
+  ClearState();
+  m_unhalt_event->Deactivate();
+}
+
+void DMA::ClearState()
 {
   for (u32 i = 0; i < NUM_CHANNELS; i++)
   {
@@ -50,7 +64,6 @@ void DMA::Reset()
   m_DICR.bits = 0;
 
   m_halt_ticks_remaining = 0;
-  m_unhalt_event->Deactivate();
 }
 
 bool DMA::DoState(StateWrapper& sw)
@@ -147,6 +160,12 @@ void DMA::WriteRegister(u32 offset, u32 value)
 
       case 0x08:
       {
+        // HACK: Due to running DMA in slices, we can't wait for the current halt time to finish before running the
+        // first block of a new channel. This affects games like FF8, where they kick a SPU transfer while a GPU
+        // transfer is happening, and the SPU transfer gets delayed until the GPU transfer unhalts and finishes, and
+        // breaks the interrupt.
+        const bool ignore_halt = !state.channel_control.enable_busy && (value & (1u << 24));
+
         state.channel_control.bits = (state.channel_control.bits & ~ChannelState::ChannelControl::WRITE_MASK) |
                                      (value & ChannelState::ChannelControl::WRITE_MASK);
         Log_TracePrintf("DMA channel %u channel control <- 0x%08X", channel_index, state.channel_control.bits);
@@ -155,7 +174,7 @@ void DMA::WriteRegister(u32 offset, u32 value)
         if (static_cast<Channel>(channel_index) == Channel::OTC)
           SetRequest(static_cast<Channel>(channel_index), state.channel_control.start_trigger);
 
-        if (CanTransferChannel(static_cast<Channel>(channel_index)))
+        if (CanTransferChannel(static_cast<Channel>(channel_index), ignore_halt))
           TransferChannel(static_cast<Channel>(channel_index));
         return;
       }
@@ -175,7 +194,7 @@ void DMA::WriteRegister(u32 offset, u32 value)
 
         for (u32 i = 0; i < NUM_CHANNELS; i++)
         {
-          if (CanTransferChannel(static_cast<Channel>(i)))
+          if (CanTransferChannel(static_cast<Channel>(i), false))
           {
             if (!TransferChannel(static_cast<Channel>(i)))
               break;
@@ -209,11 +228,11 @@ void DMA::SetRequest(Channel channel, bool request)
     return;
 
   cs.request = request;
-  if (CanTransferChannel(channel))
+  if (CanTransferChannel(channel, false))
     TransferChannel(channel);
 }
 
-bool DMA::CanTransferChannel(Channel channel) const
+bool DMA::CanTransferChannel(Channel channel, bool ignore_halt) const
 {
   if (!m_DPCR.GetMasterEnable(channel))
     return false;
@@ -222,7 +241,7 @@ bool DMA::CanTransferChannel(Channel channel) const
   if (!cs.channel_control.enable_busy)
     return false;
 
-  if (cs.channel_control.sync_mode != SyncMode::Manual && IsTransferHalted())
+  if (cs.channel_control.sync_mode != SyncMode::Manual && (IsTransferHalted() && !ignore_halt))
     return false;
 
   return cs.request;
@@ -241,6 +260,34 @@ void DMA::UpdateIRQ()
     Log_TracePrintf("Firing DMA master interrupt");
     g_interrupt_controller.InterruptRequest(InterruptController::IRQ::DMA);
   }
+}
+
+// Plenty of games seem to suffer from this issue where they have a linked list DMA going while polling the
+// controller. Using a too-large slice size will result in the serial timing being off, and the game thinking
+// the controller is disconnected. So we don't hurt performance too much for the general case, we reduce this
+// to equal CPU and DMA time when the controller is transferring, but otherwise leave it at the higher size.
+enum : u32
+{
+  SLICE_SIZE_WHEN_TRANSMITTING_PAD = 100,
+  HALT_TICKS_WHEN_TRANSMITTING_PAD = 100
+};
+
+TickCount DMA::GetTransferSliceTicks() const
+{
+#ifdef _DEBUG
+  if (g_pad.IsTransmitting())
+  {
+    Log_DebugPrintf("DMA transfer while transmitting pad - using lower slice size of %u vs %u",
+                    SLICE_SIZE_WHEN_TRANSMITTING_PAD, m_max_slice_ticks);
+  }
+#endif
+
+  return g_pad.IsTransmitting() ? SLICE_SIZE_WHEN_TRANSMITTING_PAD : m_max_slice_ticks;
+}
+
+TickCount DMA::GetTransferHaltTicks() const
+{
+  return g_pad.IsTransmitting() ? HALT_TICKS_WHEN_TRANSMITTING_PAD : m_halt_ticks;
 }
 
 bool DMA::TransferChannel(Channel channel)
@@ -274,7 +321,6 @@ bool DMA::TransferChannel(Channel channel)
 
     case SyncMode::LinkedList:
     {
-      TickCount used_ticks = 0;
       if (!copy_to_device)
       {
         Panic("Linked list not implemented for DMA reads");
@@ -285,12 +331,13 @@ bool DMA::TransferChannel(Channel channel)
                       current_address & ADDRESS_MASK);
 
       u8* ram_pointer = Bus::g_ram;
-      bool halt_transfer = false;
-      while (cs.request)
+      TickCount remaining_ticks = GetTransferSliceTicks();
+      while (cs.request && remaining_ticks > 0)
       {
         u32 header;
         std::memcpy(&header, &ram_pointer[current_address & ADDRESS_MASK], sizeof(header));
-        used_ticks++;
+        CPU::AddPendingTicks(10);
+        remaining_ticks -= 10;
 
         const u32 word_count = header >> 24;
         const u32 next_address = header & UINT32_C(0x00FFFFFF);
@@ -298,37 +345,29 @@ bool DMA::TransferChannel(Channel channel)
                         word_count * UINT32_C(4), word_count, next_address);
         if (word_count > 0)
         {
-          used_ticks +=
+          CPU::AddPendingTicks(5);
+          remaining_ticks -= 5;
+
+          const TickCount block_ticks =
             TransferMemoryToDevice(channel, (current_address + sizeof(header)) & ADDRESS_MASK, 4, word_count);
-        }
-        else if ((current_address & ADDRESS_MASK) == (next_address & ADDRESS_MASK))
-        {
-          current_address = next_address;
-          halt_transfer = true;
-          break;
+          CPU::AddPendingTicks(block_ticks);
+          remaining_ticks -= block_ticks;
         }
 
         current_address = next_address;
         if (current_address & UINT32_C(0x800000))
           break;
-
-        if (used_ticks >= m_max_slice_ticks)
-        {
-          halt_transfer = true;
-          break;
-        }
       }
 
       cs.base_address = current_address;
-      CPU::AddPendingTicks(used_ticks);
 
       if (current_address & UINT32_C(0x800000))
         break;
 
-      if (halt_transfer)
+      if (cs.request)
       {
         // stall the transfer for a bit if we ran for too long
-        HaltTransfer(m_halt_ticks);
+        HaltTransfer(GetTransferHaltTicks());
         return false;
       }
       else
@@ -348,34 +387,54 @@ bool DMA::TransferChannel(Channel channel)
 
       const u32 block_size = cs.block_control.request.GetBlockSize();
       u32 blocks_remaining = cs.block_control.request.GetBlockCount();
-      TickCount used_ticks = 0;
+      TickCount ticks_remaining = GetTransferSliceTicks();
 
       if (copy_to_device)
       {
         do
         {
           blocks_remaining--;
-          used_ticks += TransferMemoryToDevice(channel, current_address & ADDRESS_MASK, increment, block_size);
+
+          const TickCount ticks =
+            TransferMemoryToDevice(channel, current_address & ADDRESS_MASK, increment, block_size);
+          CPU::AddPendingTicks(ticks);
+          ticks_remaining -= ticks;
+
           current_address = (current_address + (increment * block_size));
-        } while (cs.request && blocks_remaining > 0);
+        } while (cs.request && blocks_remaining > 0 && ticks_remaining > 0);
       }
       else
       {
         do
         {
           blocks_remaining--;
-          used_ticks += TransferDeviceToMemory(channel, current_address & ADDRESS_MASK, increment, block_size);
+
+          const TickCount ticks =
+            TransferDeviceToMemory(channel, current_address & ADDRESS_MASK, increment, block_size);
+          CPU::AddPendingTicks(ticks);
+          ticks_remaining -= ticks;
+
           current_address = (current_address + (increment * block_size));
-        } while (cs.request && blocks_remaining > 0);
+        } while (cs.request && blocks_remaining > 0 && ticks_remaining > 0);
       }
 
       cs.base_address = current_address & BASE_ADDRESS_MASK;
       cs.block_control.request.block_count = blocks_remaining;
-      CPU::AddPendingTicks(used_ticks);
 
       // finish transfer later if the request was cleared
       if (blocks_remaining > 0)
+      {
+        if (cs.request)
+        {
+          // we got halted
+          if (!m_unhalt_event->IsActive())
+            HaltTransfer(GetTransferHaltTicks());
+
+          return false;
+        }
+
         return true;
+      }
     }
     break;
 
@@ -400,6 +459,8 @@ void DMA::HaltTransfer(TickCount duration)
 {
   m_halt_ticks_remaining += duration;
   Log_DebugPrintf("Halting DMA for %d ticks", m_halt_ticks_remaining);
+  if (m_unhalt_event->IsActive())
+    return;
 
   DebugAssert(!m_unhalt_event->IsActive());
   m_unhalt_event->SetIntervalAndSchedule(m_halt_ticks_remaining);
@@ -415,7 +476,7 @@ void DMA::UnhaltTransfer(TickCount ticks)
   // Main thing is that OTC happens after GPU, because otherwise it'll wipe out the LL.
   for (u32 i = 0; i < NUM_CHANNELS; i++)
   {
-    if (CanTransferChannel(static_cast<Channel>(i)))
+    if (CanTransferChannel(static_cast<Channel>(i), false))
     {
       if (!TransferChannel(static_cast<Channel>(i)))
         return;
@@ -476,7 +537,7 @@ TickCount DMA::TransferMemoryToDevice(Channel channel, u32 address, u32 incremen
     case Channel::MDECout:
     case Channel::PIO:
     default:
-      Panic("Unhandled DMA channel for device write");
+      Log_ErrorPrintf("Unhandled DMA channel %u for device write", static_cast<u32>(channel));
       break;
   }
 
@@ -499,7 +560,7 @@ TickCount DMA::TransferDeviceToMemory(Channel channel, u32 address, u32 incremen
 
     const u32 terminator = UINT32_C(0xFFFFFF);
     std::memcpy(&ram_pointer[address], &terminator, sizeof(terminator));
-    Bus::InvalidateCodePages(address, word_count);
+    CPU::CodeCache::InvalidateCodePages(address, word_count);
     return Bus::GetDMARAMTickCount(word_count);
   }
 
@@ -532,7 +593,7 @@ TickCount DMA::TransferDeviceToMemory(Channel channel, u32 address, u32 incremen
       break;
 
     default:
-      Panic("Unhandled DMA channel for device read");
+      Log_ErrorPrintf("Unhandled DMA channel %u for device read", static_cast<u32>(channel));
       std::fill_n(dest_pointer, word_count, UINT32_C(0xFFFFFFFF));
       break;
   }
@@ -547,6 +608,87 @@ TickCount DMA::TransferDeviceToMemory(Channel channel, u32 address, u32 incremen
     }
   }
 
-  Bus::InvalidateCodePages(address, word_count);
+  CPU::CodeCache::InvalidateCodePages(address, word_count);
   return Bus::GetDMARAMTickCount(word_count);
+}
+
+void DMA::DrawDebugStateWindow()
+{
+#ifdef WITH_IMGUI
+  static constexpr u32 NUM_COLUMNS = 10;
+  static constexpr std::array<const char*, NUM_COLUMNS> column_names = {
+    {"#", "Req", "Direction", "Chopping", "Mode", "Busy", "Enable", "Priority", "IRQ", "Flag"}};
+  static constexpr std::array<const char*, NUM_CHANNELS> channel_names = {
+    {"MDECin", "MDECout", "GPU", "CDROM", "SPU", "PIO", "OTC"}};
+  static constexpr std::array<const char*, 4> sync_mode_names = {{"Manual", "Request", "LinkedList", "Reserved"}};
+
+  const float framebuffer_scale = ImGui::GetIO().DisplayFramebufferScale.x;
+
+  ImGui::SetNextWindowSize(ImVec2(850.0f * framebuffer_scale, 250.0f * framebuffer_scale), ImGuiCond_FirstUseEver);
+  if (!ImGui::Begin("DMA State", &g_settings.debugging.show_dma_state))
+  {
+    ImGui::End();
+    return;
+  }
+
+  ImGui::Columns(NUM_COLUMNS);
+  ImGui::SetColumnWidth(0, 100.0f * framebuffer_scale);
+  ImGui::SetColumnWidth(1, 50.0f * framebuffer_scale);
+  ImGui::SetColumnWidth(2, 100.0f * framebuffer_scale);
+  ImGui::SetColumnWidth(3, 150.0f * framebuffer_scale);
+  ImGui::SetColumnWidth(4, 80.0f * framebuffer_scale);
+  ImGui::SetColumnWidth(5, 80.0f * framebuffer_scale);
+  ImGui::SetColumnWidth(6, 80.0f * framebuffer_scale);
+  ImGui::SetColumnWidth(7, 80.0f * framebuffer_scale);
+  ImGui::SetColumnWidth(8, 80.0f * framebuffer_scale);
+  ImGui::SetColumnWidth(9, 80.0f * framebuffer_scale);
+
+  for (const char* title : column_names)
+  {
+    ImGui::TextUnformatted(title);
+    ImGui::NextColumn();
+  }
+
+  const ImVec4 active(1.0f, 1.0f, 1.0f, 1.0f);
+  const ImVec4 inactive(0.5f, 0.5f, 0.5f, 1.0f);
+
+  for (u32 i = 0; i < NUM_CHANNELS; i++)
+  {
+    const ChannelState& cs = m_state[i];
+
+    ImGui::TextColored(cs.channel_control.enable_busy ? active : inactive, "%u[%s]", i, channel_names[i]);
+    ImGui::NextColumn();
+    ImGui::TextColored(cs.request ? active : inactive, cs.request ? "Yes" : "No");
+    ImGui::NextColumn();
+    ImGui::Text("%s%s", cs.channel_control.copy_to_device ? "FromRAM" : "ToRAM",
+                cs.channel_control.address_step_reverse ? " Addr+" : " Addr-");
+    ImGui::NextColumn();
+    ImGui::TextColored(cs.channel_control.chopping_enable ? active : inactive, "%s/%u/%u",
+                       cs.channel_control.chopping_enable ? "Yes" : "No",
+                       cs.channel_control.chopping_cpu_window_size.GetValue(),
+                       cs.channel_control.chopping_dma_window_size.GetValue());
+    ImGui::NextColumn();
+    ImGui::Text("%s", sync_mode_names[static_cast<u8>(cs.channel_control.sync_mode.GetValue())]);
+    ImGui::NextColumn();
+    ImGui::TextColored(cs.channel_control.enable_busy ? active : inactive, "%s%s",
+                       cs.channel_control.enable_busy ? "Busy" : "Idle",
+                       cs.channel_control.start_trigger ? " (Trigger)" : "");
+    ImGui::NextColumn();
+    ImGui::TextColored(m_DPCR.GetMasterEnable(static_cast<Channel>(i)) ? active : inactive,
+                       m_DPCR.GetMasterEnable(static_cast<Channel>(i)) ? "Enabled" : "Disabled");
+    ImGui::NextColumn();
+    ImGui::TextColored(m_DPCR.GetMasterEnable(static_cast<Channel>(i)) ? active : inactive, "%u",
+                       m_DPCR.GetPriority(static_cast<Channel>(i)));
+    ImGui::NextColumn();
+    ImGui::TextColored(m_DICR.IsIRQEnabled(static_cast<Channel>(i)) ? active : inactive,
+                       m_DICR.IsIRQEnabled(static_cast<Channel>(i)) ? "Enabled" : "Disabled");
+    ImGui::NextColumn();
+    ImGui::TextColored(m_DICR.GetIRQFlag(static_cast<Channel>(i)) ? active : inactive,
+                       m_DICR.GetIRQFlag(static_cast<Channel>(i)) ? "IRQ" : "");
+    ImGui::NextColumn();
+  }
+
+  ImGui::Columns(1);
+  ImGui::End();
+#endif
 }

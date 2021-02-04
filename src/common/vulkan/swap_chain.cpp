@@ -135,6 +135,25 @@ VkSurfaceKHR SwapChain::CreateVulkanSurface(VkInstance instance, WindowInfo& wi)
   }
 #endif
 
+#if defined(VK_USE_PLATFORM_WAYLAND_KHR)
+  if (wi.type == WindowInfo::Type::Wayland)
+  {
+    VkWaylandSurfaceCreateInfoKHR surface_create_info = {VK_STRUCTURE_TYPE_WAYLAND_SURFACE_CREATE_INFO_KHR, nullptr, 0,
+                                                         static_cast<struct wl_display*>(wi.display_connection),
+                                                         static_cast<struct wl_surface*>(wi.window_handle)};
+
+    VkSurfaceKHR surface;
+    VkResult res = vkCreateWaylandSurfaceKHR(instance, &surface_create_info, nullptr, &surface);
+    if (res != VK_SUCCESS)
+    {
+      LOG_VULKAN_ERROR(res, "vkCreateWaylandSurfaceEXT failed: ");
+      return VK_NULL_HANDLE;
+    }
+
+    return surface;
+  }
+#endif
+
 #if defined(VK_USE_PLATFORM_ANDROID_KHR)
   if (wi.type == WindowInfo::Type::Android)
   {
@@ -324,7 +343,7 @@ bool SwapChain::CreateSwapChain()
     return false;
 
   // Select number of images in swap chain, we prefer one buffer in the background to work on
-  u32 image_count = surface_capabilities.minImageCount + 1u;
+  u32 image_count = std::max(surface_capabilities.minImageCount + 1u, 2u);
 
   // maxImageCount can be zero, in which case there isn't an upper limit on the number of buffers.
   if (surface_capabilities.maxImageCount > 0)
@@ -333,7 +352,9 @@ bool SwapChain::CreateSwapChain()
   // Determine the dimensions of the swap chain. Values of -1 indicate the size we specify here
   // determines window size?
   VkExtent2D size = surface_capabilities.currentExtent;
+#ifndef ANDROID
   if (size.width == UINT32_MAX)
+#endif
   {
     size.width = m_wi.surface_width;
     size.height = m_wi.surface_height;
@@ -486,6 +507,7 @@ VkResult SwapChain::AcquireNextImage()
 
 bool SwapChain::ResizeSwapChain(u32 new_width /* = 0 */, u32 new_height /* = 0 */)
 {
+  DestroySemaphores();
   DestroySwapChainImages();
 
   if (new_width != 0 && new_height != 0)
@@ -494,7 +516,7 @@ bool SwapChain::ResizeSwapChain(u32 new_width /* = 0 */, u32 new_height /* = 0 *
     m_wi.surface_height = new_height;
   }
 
-  if (!CreateSwapChain() || !SetupSwapChainImages())
+  if (!CreateSwapChain() || !SetupSwapChainImages() || !CreateSemaphores())
   {
     Panic("Failed to re-configure swap chain images, this is fatal (for now)");
     return false;
@@ -505,9 +527,10 @@ bool SwapChain::ResizeSwapChain(u32 new_width /* = 0 */, u32 new_height /* = 0 *
 
 bool SwapChain::RecreateSwapChain()
 {
+  DestroySemaphores();
   DestroySwapChainImages();
   DestroySwapChain();
-  if (!CreateSwapChain() || !SetupSwapChainImages())
+  if (!CreateSwapChain() || !SetupSwapChainImages() || !CreateSemaphores())
   {
     Panic("Failed to re-configure swap chain images, this is fatal (for now)");
     return false;
@@ -529,6 +552,7 @@ bool SwapChain::SetVSync(bool enabled)
 bool SwapChain::RecreateSurface(const WindowInfo& new_wi)
 {
   // Destroy the old swap chain, images, and surface.
+  DestroySemaphores();
   DestroySwapChainImages();
   DestroySwapChain();
   DestroySurface();
@@ -556,7 +580,7 @@ bool SwapChain::RecreateSurface(const WindowInfo& new_wi)
   }
 
   // Finally re-create the swap chain
-  if (!CreateSwapChain() || !SetupSwapChainImages())
+  if (!CreateSwapChain() || !SetupSwapChainImages() || !CreateSemaphores())
     return false;
 
   return true;

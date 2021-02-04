@@ -1,6 +1,9 @@
 #include "generalsettingswidget.h"
 #include "autoupdaterdialog.h"
 #include "frontend-common/controller_interface.h"
+#include "mainwindow.h"
+#include "qtutils.h"
+#include "scmversion/scmversion.h"
 #include "settingsdialog.h"
 #include "settingwidgetbinder.h"
 
@@ -16,8 +19,12 @@ GeneralSettingsWidget::GeneralSettingsWidget(QtHostInterface* host_interface, QW
   }
 
   SettingWidgetBinder::BindWidgetToBoolSetting(m_host_interface, m_ui.pauseOnStart, "Main", "StartPaused", false);
+  SettingWidgetBinder::BindWidgetToBoolSetting(m_host_interface, m_ui.pauseOnFocusLoss, "Main", "PauseOnFocusLoss",
+                                               false);
   SettingWidgetBinder::BindWidgetToBoolSetting(m_host_interface, m_ui.startFullscreen, "Main", "StartFullscreen",
                                                false);
+  SettingWidgetBinder::BindWidgetToBoolSetting(m_host_interface, m_ui.hideCursorInFullscreen, "Main",
+                                               "HideCursorInFullscreen", true);
   SettingWidgetBinder::BindWidgetToBoolSetting(m_host_interface, m_ui.renderToMain, "Main", "RenderToMainWindow", true);
   SettingWidgetBinder::BindWidgetToBoolSetting(m_host_interface, m_ui.saveStateOnExit, "Main", "SaveStateOnExit", true);
   SettingWidgetBinder::BindWidgetToBoolSetting(m_host_interface, m_ui.confirmPowerOff, "Main", "ConfirmPowerOff", true);
@@ -25,30 +32,11 @@ GeneralSettingsWidget::GeneralSettingsWidget(QtHostInterface* host_interface, QW
                                                "LoadDevicesFromSaveStates", false);
   SettingWidgetBinder::BindWidgetToBoolSetting(m_host_interface, m_ui.applyGameSettings, "Main", "ApplyGameSettings",
                                                true);
-  SettingWidgetBinder::BindWidgetToBoolSetting(m_host_interface, m_ui.showOSDMessages, "Display", "ShowOSDMessages",
-                                               true);
-  SettingWidgetBinder::BindWidgetToBoolSetting(m_host_interface, m_ui.showFPS, "Display", "ShowFPS", false);
-  SettingWidgetBinder::BindWidgetToBoolSetting(m_host_interface, m_ui.showVPS, "Display", "ShowVPS", false);
-  SettingWidgetBinder::BindWidgetToBoolSetting(m_host_interface, m_ui.showSpeed, "Display", "ShowSpeed", false);
-  SettingWidgetBinder::BindWidgetToBoolSetting(m_host_interface, m_ui.showResolution, "Display", "ShowResolution",
-                                               false);
+  SettingWidgetBinder::BindWidgetToBoolSetting(m_host_interface, m_ui.autoLoadCheats, "Main", "AutoLoadCheats", false);
 
-  SettingWidgetBinder::BindWidgetToBoolSetting(m_host_interface, m_ui.enableSpeedLimiter, "Main", "SpeedLimiterEnabled",
-                                               true);
-  SettingWidgetBinder::BindWidgetToBoolSetting(m_host_interface, m_ui.increaseTimerResolution, "Main",
-                                               "IncreaseTimerResolution", true);
-  SettingWidgetBinder::BindWidgetToNormalizedSetting(m_host_interface, m_ui.emulationSpeed, "Main", "EmulationSpeed",
-                                                     100.0f, 1.0f);
   SettingWidgetBinder::BindWidgetToEnumSetting(
     m_host_interface, m_ui.controllerBackend, "Main", "ControllerBackend", &ControllerInterface::ParseBackendName,
     &ControllerInterface::GetBackendName, ControllerInterface::GetDefaultBackend());
-
-  connect(m_ui.enableSpeedLimiter, &QCheckBox::stateChanged, this,
-          &GeneralSettingsWidget::onEnableSpeedLimiterStateChanged);
-  connect(m_ui.emulationSpeed, &QSlider::valueChanged, this, &GeneralSettingsWidget::onEmulationSpeedValueChanged);
-
-  onEnableSpeedLimiterStateChanged();
-  onEmulationSpeedValueChanged(m_ui.emulationSpeed->value());
 
   dialog->registerWidgetHelp(
     m_ui.confirmPowerOff, tr("Confirm Power Off"), tr("Checked"),
@@ -59,12 +47,17 @@ GeneralSettingsWidget::GeneralSettingsWidget(QtHostInterface* host_interface, QW
                                 "resume directly from where you left off next time."));
   dialog->registerWidgetHelp(m_ui.startFullscreen, tr("Start Fullscreen"), tr("Unchecked"),
                              tr("Automatically switches to fullscreen mode when a game is started."));
+  dialog->registerWidgetHelp(m_ui.hideCursorInFullscreen, tr("Hide Cursor In Fullscreen"), tr("Checked"),
+                             tr("Hides the mouse pointer/cursor when the emulator is in fullscreen mode."));
   dialog->registerWidgetHelp(
     m_ui.renderToMain, tr("Render To Main Window"), tr("Checked"),
     tr("Renders the display of the simulated console to the main window of the application, over "
        "the game list. If unchecked, the display will render in a separate window."));
   dialog->registerWidgetHelp(m_ui.pauseOnStart, tr("Pause On Start"), tr("Unchecked"),
                              tr("Pauses the emulator when a game is started."));
+  dialog->registerWidgetHelp(m_ui.pauseOnFocusLoss, tr("Pause On Focus Loss"), tr("Unchecked"),
+                             tr("Pauses the emulator when you minimize the window or switch to another application, "
+                                "and unpauses when you switch back."));
   dialog->registerWidgetHelp(
     m_ui.loadDevicesFromSaveStates, tr("Load Devices From Save States"), tr("Unchecked"),
     tr("When enabled, memory cards and controllers will be overwritten when save states are loaded. This can "
@@ -74,29 +67,8 @@ GeneralSettingsWidget::GeneralSettingsWidget(QtHostInterface* host_interface, QW
     m_ui.applyGameSettings, tr("Apply Per-Game Settings"), tr("Checked"),
     tr("When enabled, per-game settings will be applied, and incompatible enhancements will be disabled. You should "
        "leave this option enabled except when testing enhancements with incompatible games."));
-  dialog->registerWidgetHelp(
-    m_ui.enableSpeedLimiter, tr("Enable Speed Limiter"), tr("Checked"),
-    tr("Throttles the emulation speed to the chosen speed above. If unchecked, the emulator will "
-       "run as fast as possible, which may not be playable."));
-  dialog->registerWidgetHelp(
-    m_ui.increaseTimerResolution, tr("Increase Timer Resolution"), tr("Checked"),
-    tr("Increases the system timer resolution when emulation is started to provide more accurate "
-       "frame pacing. May increase battery usage on laptops."));
-  dialog->registerWidgetHelp(
-    m_ui.emulationSpeed, tr("Emulation Speed"), "100%",
-    tr("Sets the target emulation speed. It is not guaranteed that this speed will be reached, "
-       "and if not, the emulator will run as fast as it can manage."));
-  dialog->registerWidgetHelp(m_ui.showOSDMessages, tr("Show OSD Messages"), tr("Checked"),
-                             tr("Shows on-screen-display messages when events occur such as save states being "
-                                "created/loaded, screenshots being taken, etc."));
-  dialog->registerWidgetHelp(m_ui.showFPS, tr("Show FPS"), tr("Unchecked"),
-                             tr("Shows the internal frame rate of the game in the top-right corner of the display."));
-  dialog->registerWidgetHelp(m_ui.showVPS, tr("Show VPS"), tr("Unchecked"),
-                             tr("Shows the number of frames (or v-syncs) displayed per second by the system in the "
-                                "top-right corner of the display."));
-  dialog->registerWidgetHelp(
-    m_ui.showSpeed, tr("Show Speed"), tr("Unchecked"),
-    tr("Shows the current emulation speed of the system in the top-right corner of the display as a percentage."));
+  dialog->registerWidgetHelp(m_ui.autoLoadCheats, tr("Automatically Load Cheats"), tr("Unchecked"),
+                             tr("Automatically loads and applies cheats on game start."));
   dialog->registerWidgetHelp(m_ui.controllerBackend, tr("Controller Backend"),
                              qApp->translate("ControllerInterface", ControllerInterface::GetBackendName(
                                                                       ControllerInterface::GetDefaultBackend())),
@@ -104,7 +76,7 @@ GeneralSettingsWidget::GeneralSettingsWidget(QtHostInterface* host_interface, QW
                                 "to use XInput over SDL2 for compatibility."));
 
   // Since this one is compile-time selected, we don't put it in the .ui file.
-  int current_col = 1;
+  int current_col = 0;
   int current_row = m_ui.formLayout_4->rowCount() - current_col;
 #ifdef WITH_DISCORD_PRESENCE
   {
@@ -121,27 +93,28 @@ GeneralSettingsWidget::GeneralSettingsWidget(QtHostInterface* host_interface, QW
 #endif
   if (AutoUpdaterDialog::isSupported())
   {
-    QCheckBox* enableDiscordPresence = new QCheckBox(tr("Enable Automatic Update Check"), m_ui.groupBox_4);
-    SettingWidgetBinder::BindWidgetToBoolSetting(m_host_interface, enableDiscordPresence, "AutoUpdater",
+    SettingWidgetBinder::BindWidgetToBoolSetting(m_host_interface, m_ui.autoUpdateEnabled, "AutoUpdater",
                                                  "CheckAtStartup", true);
-    m_ui.formLayout_4->addWidget(enableDiscordPresence, current_row, current_col);
-    dialog->registerWidgetHelp(enableDiscordPresence, tr("Enable Automatic Update Check"), tr("Checked"),
+    dialog->registerWidgetHelp(m_ui.autoUpdateEnabled, tr("Enable Automatic Update Check"), tr("Checked"),
                                tr("Automatically checks for updates to the program on startup. Updates can be deferred "
                                   "until later or skipped entirely."));
+
+    m_ui.autoUpdateTag->addItems(AutoUpdaterDialog::getTagList());
+    SettingWidgetBinder::BindWidgetToStringSetting(m_host_interface, m_ui.autoUpdateTag, "AutoUpdater", "UpdateTag",
+                                                   AutoUpdaterDialog::getDefaultTag());
+
+    m_ui.autoUpdateCurrentVersion->setText(tr("%1 (%2)").arg(g_scm_tag_str).arg(g_scm_date_str));
+    connect(m_ui.checkForUpdates, &QPushButton::clicked,
+            [this]() { m_host_interface->getMainWindow()->checkForUpdates(true); });
     current_col++;
     current_row += (current_col / 2);
     current_col %= 2;
   }
+  else
+  {
+    m_ui.verticalLayout->removeWidget(m_ui.automaticUpdaterGroup);
+    m_ui.automaticUpdaterGroup->hide();
+  }
 }
 
 GeneralSettingsWidget::~GeneralSettingsWidget() = default;
-
-void GeneralSettingsWidget::onEnableSpeedLimiterStateChanged()
-{
-  m_ui.emulationSpeed->setDisabled(!m_ui.enableSpeedLimiter->isChecked());
-}
-
-void GeneralSettingsWidget::onEmulationSpeedValueChanged(int value)
-{
-  m_ui.emulationSpeedLabel->setText(tr("%1%").arg(value));
-}

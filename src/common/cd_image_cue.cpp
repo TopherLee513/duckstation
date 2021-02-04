@@ -18,6 +18,7 @@ public:
   bool OpenAndParse(const char* filename);
 
   bool ReadSubChannelQ(SubChannelQ* subq) override;
+  bool HasNonStandardSubchannel() const override;
 
 protected:
   bool ReadSectorFromIndex(void* buffer, const Index& index, LBA lba_in_index) override;
@@ -94,8 +95,21 @@ bool CDImageCueSheet::OpenAndParse(const char* filename)
     }
     if (track_file_index == m_files.size())
     {
-      std::string track_full_filename = basepath + track_filename;
+      const std::string track_full_filename(basepath + track_filename);
       std::FILE* track_fp = FileSystem::OpenCFile(track_full_filename.c_str(), "rb");
+      if (!track_fp && track_file_index == 0)
+      {
+        // many users have bad cuesheets, or they're renamed the files without updating the cuesheet.
+        // so, try searching for a bin with the same name as the cue, but only for the first referenced file.
+        const std::string alternative_filename(FileSystem::ReplaceExtension(filename, "bin"));
+        track_fp = FileSystem::OpenCFile(alternative_filename.c_str(), "rb");
+        if (track_fp)
+        {
+          Log_WarningPrintf("Your cue sheet references an invalid file '%s', but this was found at '%s' instead.",
+                            track_filename.c_str(), alternative_filename.c_str());
+        }
+      }
+
       if (!track_fp)
       {
         Log_ErrorPrintf("Failed to open track filename '%s' (from '%s' and '%s'): errno %d",
@@ -125,14 +139,27 @@ bool CDImageCueSheet::OpenAndParse(const char* filename)
       std::fseek(m_files[track_file_index].file, 0, SEEK_SET);
 
       file_size /= track_sector_size;
-      Assert(track_start < file_size);
+      if (track_start >= file_size)
+      {
+        Log_ErrorPrintf("Failed to open track %u in '%s': track start is out of range (%u vs %u)", track_num, filename,
+                        track_start, file_size);
+        return false;
+      }
+
       track_length = file_size - track_start;
     }
 
-    // two seconds pregap for track 1 is assumed if not specified
+    // Two seconds pregap for track 1 is assumed if not specified.
+    // Some people have broken (older) dumps where a two second pregap was implicit but not specified in the cuesheet.
+    // The problem is we can't tell between a missing implicit two second pregap and a zero second pregap. Most of these
+    // seem to be a single bin file for all tracks. So if this is the case, we add the two seconds in if it's not
+    // specified. If this is an audio CD (likely when track 1 is not data), we don't add these pregaps, and rely on the
+    // cuesheet. If we did add them, it causes issues in some games (e.g. Dancing Stage featuring DREAMS COME TRUE).
     long pregap_frames = track_get_zero_pre(track);
-    bool pregap_in_file = pregap_frames > 0 && track_start >= pregap_frames;
-    if (track_num == 1 && pregap_frames < 0)
+    const bool pregap_in_file = pregap_frames > 0 && track_start >= pregap_frames;
+    const bool is_multi_track_bin = (track_num > 1 && track_file_index == m_indices[0].file_index);
+    const bool likely_audio_cd = static_cast<TrackMode>(track_get_mode(cd_get_track(m_cd, 1))) == TrackMode::Audio;
+    if ((track_num == 1 || is_multi_track_bin) && pregap_frames < 0 && (track_num == 1 || !likely_audio_cd))
       pregap_frames = 2 * FRAMES_PER_SECOND;
 
     // create the index for the pregap
@@ -212,6 +239,12 @@ bool CDImageCueSheet::OpenAndParse(const char* filename)
     }
   }
 
+  if (m_tracks.empty())
+  {
+    Log_ErrorPrintf("File '%s' contains no tracks", filename);
+    return false;
+  }
+
   m_lba_count = disc_lba;
   AddLeadOutIndex();
 
@@ -226,6 +259,11 @@ bool CDImageCueSheet::ReadSubChannelQ(SubChannelQ* subq)
     return true;
 
   return CDImage::ReadSubChannelQ(subq);
+}
+
+bool CDImageCueSheet::HasNonStandardSubchannel() const
+{
+  return (m_sbi.GetReplacementSectorCount() > 0);
 }
 
 bool CDImageCueSheet::ReadSectorFromIndex(void* buffer, const Index& index, LBA lba_in_index)

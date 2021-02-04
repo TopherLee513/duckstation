@@ -21,8 +21,8 @@ add_library(common
   cd_xa.cpp
   cd_xa.h
   cpu_detect.h
-  cubeb_audio_stream.cpp
-  cubeb_audio_stream.h
+  crash_handler.cpp
+  crash_handler.h
   dimensional_array.h
   event.cpp
   event.h
@@ -56,10 +56,16 @@ add_library(common
   minizip_helpers.h
   null_audio_stream.cpp
   null_audio_stream.h
+  memory_arena.cpp
+  memory_arena.h
+  page_fault_handler.cpp
+  page_fault_handler.h
   rectangle.h
   progress_callback.cpp
   progress_callback.h
   scope_guard.h
+  shiftjis.cpp
+  shiftjis.h
   state_wrapper.cpp
   state_wrapper.h
   string.cpp
@@ -97,7 +103,7 @@ add_library(common
 
 target_include_directories(common PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/..")
 target_include_directories(common PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/..")
-target_link_libraries(common PRIVATE glad libcue stb Threads::Threads cubeb libchdr glslang vulkan-loader zlib minizip)
+target_link_libraries(common PRIVATE glad libcue stb Threads::Threads libchdr glslang vulkan-loader zlib minizip samplerate)
 
 if(WIN32)
   target_sources(common PRIVATE
@@ -113,6 +119,8 @@ if(WIN32)
     d3d11/stream_buffer.h
     d3d11/texture.cpp
     d3d11/texture.h
+    thirdparty/StackWalker.cpp
+    thirdparty/StackWalker.h
     windows_headers.h
     win32_progress_callback.cpp
     win32_progress_callback.h
@@ -134,6 +142,14 @@ if(USE_X11)
   target_link_libraries(common PRIVATE "${X11_LIBRARIES}")
 endif()
 
+if(USE_DRMKMS)
+  target_sources(common PRIVATE
+    drm_display.cpp
+    drm_display.h
+  )
+  target_link_libraries(common PUBLIC Libdrm::Libdrm)
+endif()
+
 if(USE_EGL)
   target_sources(common PRIVATE
     gl/context_egl.cpp
@@ -146,12 +162,25 @@ if(USE_EGL)
       gl/context_egl_x11.cpp
       gl/context_egl_x11.h
     )
+
+    # We set EGL_NO_X11 because otherwise X comes in with its macros and breaks
+    # a bunch of files from compiling, if we include the EGL headers. This just
+    # makes the data types opaque, we can still use it with X11 if needed.
+    target_compile_definitions(common PRIVATE "-DEGL_NO_X11=1")
   endif()
   if(ANDROID AND USE_EGL)
     target_sources(common PRIVATE
       gl/context_egl_android.cpp
       gl/context_egl_android.h
     )
+  endif()
+  if(USE_DRMKMS)
+    target_compile_definitions(common PRIVATE "-DUSE_GBM=1")
+    target_sources(common PRIVATE
+      gl/context_egl_gbm.cpp
+      gl/context_egl_gbm.h
+    )
+    target_link_libraries(common PUBLIC GBM::GBM)
   endif()
 endif()
 
@@ -173,8 +202,15 @@ if(USE_WAYLAND)
 endif()
 
 if(APPLE)
+  # Needed for Vulkan Swap Chain.
+  target_link_libraries(common PRIVATE "objc")
   target_sources(common PRIVATE
     gl/context_agl.mm
     gl/context_agl.h
   )
+endif()
+
+if(${CMAKE_SYSTEM_NAME} STREQUAL "Linux")
+  # We need -lrt for shm_unlink
+  target_link_libraries(common PRIVATE rt)
 endif()

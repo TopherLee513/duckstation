@@ -5,10 +5,11 @@
 #include "common/file_system.h"
 #include "common/log.h"
 #include "common/string_util.h"
+#include "core/cheats.h"
 #include "core/controller.h"
-#include "core/game_list.h"
 #include "core/gpu.h"
 #include "core/system.h"
+#include "frontend-common/game_list.h"
 #include "frontend-common/imgui_styles.h"
 #include "frontend-common/ini_settings_interface.h"
 #include "frontend-common/opengl_host_display.h"
@@ -27,6 +28,7 @@
 #include <QtCore/QFile>
 #include <QtCore/QTimer>
 #include <QtCore/QTranslator>
+#include <QtWidgets/QFileDialog>
 #include <QtWidgets/QMenu>
 #include <QtWidgets/QMessageBox>
 #include <algorithm>
@@ -42,7 +44,7 @@ Log_SetChannel(QtHostInterface);
 
 QtHostInterface::QtHostInterface(QObject* parent) : QObject(parent), CommonHostInterface()
 {
-  qRegisterMetaType<SystemBootParameters>();
+  qRegisterMetaType<std::shared_ptr<const SystemBootParameters>>();
 }
 
 QtHostInterface::~QtHostInterface()
@@ -60,10 +62,15 @@ std::vector<std::pair<QString, QString>> QtHostInterface::getAvailableLanguageLi
   return {{QStringLiteral("English"), QStringLiteral("")},
           {QStringLiteral("Deutsch"), QStringLiteral("de")},
           {QStringLiteral("Español"), QStringLiteral("es")},
+          {QStringLiteral("Français"), QStringLiteral("fr")},
           {QStringLiteral("עברית"), QStringLiteral("he")},
+          {QStringLiteral("日本語"), QStringLiteral("ja")},
           {QStringLiteral("Italiano"), QStringLiteral("it")},
+          {QStringLiteral("Nederlands"), QStringLiteral("nl")},
+          {QStringLiteral("Polski"), QStringLiteral("pl")},
           {QStringLiteral("Português (Pt)"), QStringLiteral("pt-pt")},
           {QStringLiteral("Português (Br)"), QStringLiteral("pt-br")},
+          {QStringLiteral("Русский"), QStringLiteral("ru")},
           {QStringLiteral("简体中文"), QStringLiteral("zh-cn")}};
 }
 
@@ -142,7 +149,7 @@ void QtHostInterface::ReportError(const char* message)
   if (was_fullscreen)
     SetFullscreen(false);
 
-  emit errorReported(QString::fromLocal8Bit(message));
+  emit errorReported(QString::fromUtf8(message));
 
   if (was_fullscreen)
     SetFullscreen(true);
@@ -152,7 +159,14 @@ void QtHostInterface::ReportMessage(const char* message)
 {
   HostInterface::ReportMessage(message);
 
-  emit messageReported(QString::fromLocal8Bit(message));
+  emit messageReported(QString::fromUtf8(message));
+}
+
+void QtHostInterface::ReportDebuggerMessage(const char* message)
+{
+  HostInterface::ReportDebuggerMessage(message);
+
+  emit debuggerMessageReported(QString::fromUtf8(message));
 }
 
 bool QtHostInterface::ConfirmMessage(const char* message)
@@ -161,18 +175,12 @@ bool QtHostInterface::ConfirmMessage(const char* message)
   if (was_fullscreen)
     SetFullscreen(false);
 
-  const bool result = messageConfirmed(QString::fromLocal8Bit(message));
+  const bool result = messageConfirmed(QString::fromUtf8(message));
 
   if (was_fullscreen)
     SetFullscreen(true);
 
   return result;
-}
-
-bool QtHostInterface::parseCommandLineParameters(int argc, char* argv[],
-                                                 std::unique_ptr<SystemBootParameters>* out_boot_params)
-{
-  return CommonHostInterface::ParseCommandLineParameters(argc, argv, out_boot_params);
 }
 
 std::string QtHostInterface::GetStringSettingValue(const char* section, const char* key,
@@ -298,6 +306,11 @@ void QtHostInterface::applySettings(bool display_osd_messages /* = false */)
     return;
   }
 
+  ApplySettings(display_osd_messages);
+}
+
+void QtHostInterface::ApplySettings(bool display_osd_messages)
+{
   Settings old_settings(std::move(g_settings));
   {
     std::lock_guard<std::recursive_mutex> guard(m_settings_mutex);
@@ -331,7 +344,7 @@ void QtHostInterface::refreshGameList(bool invalidate_cache /* = false */, bool 
   std::lock_guard<std::recursive_mutex> lock(m_settings_mutex);
   m_game_list->SetSearchDirectoriesFromSettings(*m_settings_interface.get());
 
-  QtProgressCallback progress(m_main_window);
+  QtProgressCallback progress(m_main_window, invalidate_cache ? 0.0f : 1.0f);
   m_game_list->Refresh(invalidate_cache, invalidate_database, &progress);
   emit gameListRefreshed();
 }
@@ -342,16 +355,21 @@ void QtHostInterface::setMainWindow(MainWindow* window)
   m_main_window = window;
 }
 
-void QtHostInterface::bootSystem(const SystemBootParameters& params)
+void QtHostInterface::bootSystem(std::shared_ptr<const SystemBootParameters> params)
 {
   if (!isOnWorkerThread())
   {
-    QMetaObject::invokeMethod(this, "bootSystem", Qt::QueuedConnection, Q_ARG(const SystemBootParameters&, params));
+    QMetaObject::invokeMethod(this, "bootSystem", Qt::QueuedConnection,
+                              Q_ARG(std::shared_ptr<const SystemBootParameters>, std::move(params)));
     return;
   }
 
   emit emulationStarting();
-  BootSystem(params);
+  if (!BootSystem(*params))
+    return;
+
+  // force a frame to be drawn to repaint the window
+  renderDisplay();
 }
 
 void QtHostInterface::resumeSystemFromState(const QString& filename, bool boot_on_failure)
@@ -372,14 +390,14 @@ void QtHostInterface::resumeSystemFromState(const QString& filename, bool boot_o
 
 void QtHostInterface::resumeSystemFromMostRecentState()
 {
-  if (!isOnWorkerThread())
+  std::string state_filename = GetMostRecentResumeSaveStatePath();
+  if (state_filename.empty())
   {
-    QMetaObject::invokeMethod(this, "resumeSystemFromMostRecentState");
+    emit errorReported(tr("No resume save state found."));
     return;
   }
 
-  emit emulationStarting();
-  ResumeSystemFromMostRecentState();
+  loadState(QString::fromStdString(state_filename));
 }
 
 void QtHostInterface::onDisplayWindowKeyEvent(int key, bool pressed)
@@ -435,6 +453,15 @@ void QtHostInterface::onHostDisplayWindowResized(int width, int height)
   // re-render the display, since otherwise it will be out of date and stretched if paused
   if (!System::IsShutdown())
   {
+    if (m_is_exclusive_fullscreen && !m_display->IsFullscreen())
+    {
+      // we lost exclusive fullscreen
+      AddOSDMessage(TranslateStdString("OSDMessage", "Lost exclusive fullscreen."), 20.0f);
+      m_is_exclusive_fullscreen = false;
+      m_is_fullscreen = false;
+      updateDisplayState();
+    }
+
     g_gpu->UpdateResolutionScale();
     renderDisplay();
   }
@@ -471,21 +498,23 @@ bool QtHostInterface::AcquireHostDisplay()
 
   m_is_rendering_to_main = m_settings_interface->GetBoolValue("Main", "RenderToMainWindow", true);
 
-  QtDisplayWidget* display_widget =
-    createDisplayRequested(m_worker_thread, QString::fromStdString(g_settings.gpu_adapter),
-                           g_settings.gpu_use_debug_device, m_is_fullscreen, m_is_rendering_to_main);
+  QtDisplayWidget* display_widget = createDisplayRequested(m_worker_thread, m_is_fullscreen, m_is_rendering_to_main);
   if (!display_widget || !m_display->HasRenderDevice())
   {
     emit destroyDisplayRequested();
-    m_display = nullptr;
+    m_display.reset();
     return false;
   }
 
   createImGuiContext(display_widget->devicePixelRatioFromScreen());
 
   if (!m_display->MakeRenderContextCurrent() ||
-      !m_display->InitializeRenderDevice(GetShaderCacheBasePath(), g_settings.gpu_use_debug_device))
+      !m_display->InitializeRenderDevice(GetShaderCacheBasePath(), g_settings.gpu_use_debug_device,
+                                         g_settings.gpu_threaded_presentation) ||
+      !m_display->CreateImGuiContext() || !m_display->UpdateImGuiFontTexture() || !CreateHostDisplayResources())
   {
+    ReleaseHostDisplayResources();
+    m_display->DestroyImGuiContext();
     destroyImGuiContext();
     m_display->DestroyRenderDevice();
     emit destroyDisplayRequested();
@@ -494,6 +523,7 @@ bool QtHostInterface::AcquireHostDisplay()
   }
 
   connectDisplaySignals(display_widget);
+  m_is_exclusive_fullscreen = m_display->IsFullscreen();
   ImGui::NewFrame();
   return true;
 }
@@ -550,10 +580,12 @@ void QtHostInterface::updateDisplayState()
     Panic("Failed to make device context current after updating");
 
   connectDisplaySignals(display_widget);
+  m_is_exclusive_fullscreen = m_display->IsFullscreen();
 
   if (!System::IsShutdown())
   {
     g_gpu->UpdateResolutionScale();
+    UpdateSoftwareCursor();
     redrawDisplayWindow();
   }
   UpdateSpeedLimiterState();
@@ -563,6 +595,8 @@ void QtHostInterface::ReleaseHostDisplay()
 {
   Assert(m_display);
 
+  ReleaseHostDisplayResources();
+  m_display->DestroyImGuiContext();
   m_display->DestroyRenderDevice();
   destroyImGuiContext();
   emit destroyDisplayRequested();
@@ -583,6 +617,20 @@ bool QtHostInterface::SetFullscreen(bool enabled)
   m_is_fullscreen = enabled;
   updateDisplayState();
   return true;
+}
+
+bool QtHostInterface::RequestRenderWindowSize(s32 new_window_width, s32 new_window_height)
+{
+  if (new_window_width <= 0 || new_window_height <= 0 || m_is_fullscreen || m_is_exclusive_fullscreen)
+    return false;
+
+  emit displaySizeRequested(new_window_width, new_window_height);
+  return true;
+}
+
+void* QtHostInterface::GetTopLevelWindowHandle() const
+{
+  return reinterpret_cast<void*>(m_main_window->winId());
 }
 
 void QtHostInterface::PollAndUpdate()
@@ -641,6 +689,7 @@ void QtHostInterface::OnSystemDestroyed()
 {
   CommonHostInterface::OnSystemDestroyed();
 
+  ClearOSDMessages();
   startBackgroundControllerPollTimer();
   emit emulationStopped();
 }
@@ -679,7 +728,12 @@ void QtHostInterface::LoadSettings()
 {
   m_settings_interface = std::make_unique<INISettingsInterface>(CommonHostInterface::GetSettingsFileName());
 
-  CommonHostInterface::CheckSettings(*m_settings_interface.get());
+  if (!CommonHostInterface::CheckSettings(*m_settings_interface.get()))
+  {
+    QTimer::singleShot(1000,
+                       [this]() { ReportError("Settings version mismatch, settings have been reset to defaults."); });
+  }
+
   CommonHostInterface::LoadSettings(*m_settings_interface.get());
   CommonHostInterface::FixIncompatibleSettings(false);
 }
@@ -688,12 +742,23 @@ void QtHostInterface::SetDefaultSettings(SettingsInterface& si)
 {
   CommonHostInterface::SetDefaultSettings(si);
 
+  si.SetStringValue("Hotkeys", "PowerOff", "Keyboard/Escape");
+  si.SetStringValue("Hotkeys", "LoadSelectedSaveState", "Keyboard/F1");
+  si.SetStringValue("Hotkeys", "SaveSelectedSaveState", "Keyboard/F2");
+  si.SetStringValue("Hotkeys", "SelectPreviousSaveStateSlot", "Keyboard/F3");
+  si.SetStringValue("Hotkeys", "SelectNextSaveStateSlot", "Keyboard/F4");
+
   si.SetBoolValue("Main", "RenderToMainWindow", true);
 }
 
 void QtHostInterface::UpdateInputMap()
 {
   updateInputMap();
+}
+
+void QtHostInterface::SetMouseMode(bool relative, bool hide_cursor)
+{
+  emit mouseModeRequested(relative, hide_cursor);
 }
 
 void QtHostInterface::updateInputMap()
@@ -716,8 +781,17 @@ void QtHostInterface::applyInputProfile(const QString& profile_path)
     return;
   }
 
-  std::lock_guard<std::recursive_mutex> lock(m_settings_mutex);
-  ApplyInputProfile(profile_path.toUtf8().data(), *m_settings_interface.get());
+  Settings old_settings(std::move(g_settings));
+  {
+    std::lock_guard<std::recursive_mutex> lock(m_settings_mutex);
+    CommonHostInterface::ApplyInputProfile(profile_path.toUtf8().data(), *m_settings_interface.get());
+    CommonHostInterface::LoadSettings(*m_settings_interface.get());
+    CommonHostInterface::ApplyGameSettings(false);
+    CommonHostInterface::FixIncompatibleSettings(false);
+  }
+
+  CheckForSettingsChanges(old_settings);
+
   emit inputProfileLoaded();
 }
 
@@ -730,7 +804,7 @@ void QtHostInterface::saveInputProfile(const QString& profile_name)
 QString QtHostInterface::getUserDirectoryRelativePath(const QString& arg) const
 {
   QString result = QString::fromStdString(m_user_directory);
-  result += FS_OSPATH_SEPERATOR_CHARACTER;
+  result += FS_OSPATH_SEPARATOR_CHARACTER;
   result += arg;
   return result;
 }
@@ -738,7 +812,7 @@ QString QtHostInterface::getUserDirectoryRelativePath(const QString& arg) const
 QString QtHostInterface::getProgramDirectoryRelativePath(const QString& arg) const
 {
   QString result = QString::fromStdString(m_program_directory);
-  result += FS_OSPATH_SEPERATOR_CHARACTER;
+  result += FS_OSPATH_SEPARATOR_CHARACTER;
   result += arg;
   return result;
 }
@@ -756,13 +830,21 @@ void QtHostInterface::powerOffSystem()
     return;
   }
 
-  if (System::IsShutdown())
-    return;
-
   if (g_settings.save_state_on_exit)
     SaveResumeSaveState();
 
-  DestroySystem();
+  PowerOffSystem();
+}
+
+void QtHostInterface::powerOffSystemWithoutSaving()
+{
+  if (!isOnWorkerThread())
+  {
+    QMetaObject::invokeMethod(this, "powerOffSystemWithoutSaving", Qt::QueuedConnection);
+    return;
+  }
+
+  PowerOffSystem();
 }
 
 void QtHostInterface::synchronousPowerOffSystem()
@@ -790,11 +872,13 @@ void QtHostInterface::resetSystem()
   HostInterface::ResetSystem();
 }
 
-void QtHostInterface::pauseSystem(bool paused)
+void QtHostInterface::pauseSystem(bool paused, bool wait_until_paused /* = false */)
 {
   if (!isOnWorkerThread())
   {
-    QMetaObject::invokeMethod(this, "pauseSystem", Qt::QueuedConnection, Q_ARG(bool, paused));
+    QMetaObject::invokeMethod(this, "pauseSystem",
+                              wait_until_paused ? Qt::BlockingQueuedConnection : Qt::QueuedConnection,
+                              Q_ARG(bool, paused), Q_ARG(bool, wait_until_paused));
     return;
   }
 
@@ -876,7 +960,7 @@ void QtHostInterface::populateSaveStateMenus(const char* game_code, QMenu* load_
     add_slot(tr("Global Save %1 (%2)"), tr("Global Save %1 (Empty)"), true, static_cast<s32>(slot));
 }
 
-void QtHostInterface::populateGameListContextMenu(const char* game_code, QWidget* parent_window, QMenu* menu)
+void QtHostInterface::populateGameListContextMenu(const GameListEntry* entry, QWidget* parent_window, QMenu* menu)
 {
   QAction* resume_action = menu->addAction(tr("Resume"));
   resume_action->setEnabled(false);
@@ -884,51 +968,92 @@ void QtHostInterface::populateGameListContextMenu(const char* game_code, QWidget
   QMenu* load_state_menu = menu->addMenu(tr("Load State"));
   load_state_menu->setEnabled(false);
 
-  const std::vector<SaveStateInfo> available_states(GetAvailableSaveStates(game_code));
-  const QString timestamp_format = QLocale::system().dateTimeFormat(QLocale::ShortFormat);
-  for (const SaveStateInfo& ssi : available_states)
+  if (!entry->code.empty())
   {
-    if (ssi.global)
-      continue;
-
-    const s32 slot = ssi.slot;
-    const QDateTime timestamp(QDateTime::fromSecsSinceEpoch(static_cast<qint64>(ssi.timestamp)));
-    const QString timestamp_str(timestamp.toString(timestamp_format));
-    const QString path(QString::fromStdString(ssi.path));
-
-    QAction* action;
-    if (slot < 0)
+    const std::vector<SaveStateInfo> available_states(GetAvailableSaveStates(entry->code.c_str()));
+    const QString timestamp_format = QLocale::system().dateTimeFormat(QLocale::ShortFormat);
+    for (const SaveStateInfo& ssi : available_states)
     {
-      resume_action->setText(tr("Resume (%1)").arg(timestamp_str));
-      resume_action->setEnabled(true);
-      action = resume_action;
-    }
-    else
-    {
-      load_state_menu->setEnabled(true);
-      action = load_state_menu->addAction(tr("%1 Save %2 (%3)").arg(tr("Game")).arg(slot).arg(timestamp_str));
-    }
+      if (ssi.global)
+        continue;
 
-    connect(action, &QAction::triggered, [this, path]() { loadState(path); });
+      const s32 slot = ssi.slot;
+      const QDateTime timestamp(QDateTime::fromSecsSinceEpoch(static_cast<qint64>(ssi.timestamp)));
+      const QString timestamp_str(timestamp.toString(timestamp_format));
+      const QString path(QString::fromStdString(ssi.path));
+
+      QAction* action;
+      if (slot < 0)
+      {
+        resume_action->setText(tr("Resume (%1)").arg(timestamp_str));
+        resume_action->setEnabled(true);
+        action = resume_action;
+      }
+      else
+      {
+        load_state_menu->setEnabled(true);
+        action = load_state_menu->addAction(tr("Game Save %1 (%2)").arg(slot).arg(timestamp_str));
+      }
+
+      connect(action, &QAction::triggered, [this, path]() { loadState(path); });
+    }
   }
+
+  QAction* open_memory_cards_action = menu->addAction(tr("Edit Memory Cards..."));
+  connect(open_memory_cards_action, &QAction::triggered, [this, entry]() {
+    QString paths[2];
+    for (u32 i = 0; i < 2; i++)
+    {
+      MemoryCardType type = g_settings.memory_card_types[i];
+      if (entry->code.empty() && type == MemoryCardType::PerGame)
+        type = MemoryCardType::Shared;
+
+      switch (type)
+      {
+        case MemoryCardType::None:
+          continue;
+        case MemoryCardType::Shared:
+          if (g_settings.memory_card_paths[i].empty())
+          {
+            paths[i] = QString::fromStdString(GetSharedMemoryCardPath(i));
+          }
+          else
+          {
+            QFileInfo path(QString::fromStdString(g_settings.memory_card_paths[i]));
+            path.makeAbsolute();
+            paths[i] = QDir::toNativeSeparators(path.canonicalFilePath());
+          }
+          break;
+        case MemoryCardType::PerGame:
+          paths[i] = QString::fromStdString(GetGameMemoryCardPath(entry->code.c_str(), i));
+          break;
+        case MemoryCardType::PerGameTitle:
+          paths[i] = QString::fromStdString(GetGameMemoryCardPath(entry->title.c_str(), i));
+          break;
+        default:
+          break;
+      }
+    }
+
+    m_main_window->openMemoryCardEditor(paths[0], paths[1]);
+  });
 
   const bool has_any_states = resume_action->isEnabled() || load_state_menu->isEnabled();
   QAction* delete_save_states_action = menu->addAction(tr("Delete Save States..."));
   delete_save_states_action->setEnabled(has_any_states);
   if (has_any_states)
   {
-    const std::string game_code_copy(game_code);
-    connect(delete_save_states_action, &QAction::triggered, [this, parent_window, game_code_copy] {
+    connect(delete_save_states_action, &QAction::triggered, [this, parent_window, entry] {
       if (QMessageBox::warning(
             parent_window, tr("Confirm Save State Deletion"),
             tr("Are you sure you want to delete all save states for %1?\n\nThe saves will not be recoverable.")
-              .arg(game_code_copy.c_str()),
+              .arg(QString::fromStdString(entry->code)),
             QMessageBox::Yes, QMessageBox::No) != QMessageBox::Yes)
       {
         return;
       }
 
-      DeleteSaveStates(game_code_copy.c_str(), true);
+      DeleteSaveStates(entry->code.c_str(), true);
     });
   }
 }
@@ -949,6 +1074,125 @@ void QtHostInterface::populatePlaylistEntryMenu(QMenu* menu)
     connect(action, &QAction::triggered, [this, i]() { changeDiscFromPlaylist(i); });
     menu->addAction(action);
   }
+}
+
+void QtHostInterface::populateCheatsMenu(QMenu* menu)
+{
+  Assert(!isOnWorkerThread());
+  if (!System::IsValid())
+    return;
+
+  const bool has_cheat_list = System::HasCheatList();
+
+  QMenu* enabled_menu = menu->addMenu(tr("&Enabled Cheats"));
+  enabled_menu->setEnabled(has_cheat_list);
+  QMenu* apply_menu = menu->addMenu(tr("&Apply Cheats"));
+  apply_menu->setEnabled(has_cheat_list);
+  if (has_cheat_list)
+  {
+    CheatList* cl = System::GetCheatList();
+    for (u32 i = 0; i < cl->GetCodeCount(); i++)
+    {
+      CheatCode& cc = cl->GetCode(i);
+      QString desc(QString::fromStdString(cc.description));
+      if (cc.IsManuallyActivated())
+      {
+        QAction* action = apply_menu->addAction(desc);
+        connect(action, &QAction::triggered, [this, i]() { applyCheat(i); });
+      }
+      else
+      {
+        QAction* action = enabled_menu->addAction(desc);
+        action->setCheckable(true);
+        action->setChecked(cc.enabled);
+        connect(action, &QAction::toggled, [this, i](bool enabled) { setCheatEnabled(i, enabled); });
+      }
+    }
+  }
+}
+
+void QtHostInterface::loadCheatList(const QString& filename)
+{
+  if (!isOnWorkerThread())
+  {
+    QMetaObject::invokeMethod(this, "loadCheatList", Qt::QueuedConnection, Q_ARG(const QString&, filename));
+    return;
+  }
+
+  LoadCheatList(filename.toUtf8().constData());
+}
+
+void QtHostInterface::setCheatEnabled(quint32 index, bool enabled)
+{
+  if (!isOnWorkerThread())
+  {
+    QMetaObject::invokeMethod(this, "setCheatEnabled", Qt::QueuedConnection, Q_ARG(quint32, index),
+                              Q_ARG(bool, enabled));
+    return;
+  }
+
+  SetCheatCodeState(index, enabled, g_settings.auto_load_cheats);
+}
+
+void QtHostInterface::applyCheat(quint32 index)
+{
+  if (!isOnWorkerThread())
+  {
+    QMetaObject::invokeMethod(this, "applyCheat", Qt::QueuedConnection, Q_ARG(quint32, index));
+    return;
+  }
+
+  ApplyCheatCode(index);
+}
+
+void QtHostInterface::reloadPostProcessingShaders()
+{
+  if (!isOnWorkerThread())
+  {
+    QMetaObject::invokeMethod(this, "reloadPostProcessingShaders", Qt::QueuedConnection);
+    return;
+  }
+
+  ReloadPostProcessingShaders();
+}
+
+void QtHostInterface::requestRenderWindowScale(qreal scale)
+{
+  if (!isOnWorkerThread())
+  {
+    QMetaObject::invokeMethod(this, "requestRenderWindowScale", Qt::QueuedConnection, Q_ARG(qreal, scale));
+    return;
+  }
+
+  RequestRenderWindowScale(scale);
+}
+
+void QtHostInterface::executeOnEmulationThread(std::function<void()> callback, bool wait)
+{
+  if (isOnWorkerThread())
+  {
+    callback();
+    if (wait)
+      m_worker_thread_sync_execute_done.Signal();
+
+    return;
+  }
+
+  QMetaObject::invokeMethod(this, "executeOnEmulationThread", Qt::QueuedConnection,
+                            Q_ARG(std::function<void()>, std::move(callback)), Q_ARG(bool, wait));
+  if (wait)
+  {
+    // don't deadlock
+    while (!m_worker_thread_sync_execute_done.TryWait(10))
+      qApp->processEvents(QEventLoop::ExcludeSocketNotifiers);
+    m_worker_thread_sync_execute_done.Reset();
+  }
+}
+
+void QtHostInterface::RunLater(std::function<void()> func)
+{
+  QMetaObject::invokeMethod(this, "executeOnEmulationThread", Qt::QueuedConnection,
+                            Q_ARG(std::function<void()>, std::move(func)), Q_ARG(bool, false));
 }
 
 void QtHostInterface::loadState(const QString& filename)
@@ -993,39 +1237,41 @@ void QtHostInterface::saveState(bool global, qint32 slot, bool block_until_done 
     SaveState(global, slot);
 }
 
-void QtHostInterface::setAudioOutputVolume(int value)
+void QtHostInterface::setAudioOutputVolume(int volume, int fast_forward_volume)
 {
   if (!isOnWorkerThread())
   {
-    QMetaObject::invokeMethod(this, "setAudioOutputVolume", Q_ARG(int, value));
+    QMetaObject::invokeMethod(this, "setAudioOutputVolume", Qt::QueuedConnection, Q_ARG(int, volume),
+                              Q_ARG(int, fast_forward_volume));
     return;
   }
 
-  if (m_audio_stream)
-    m_audio_stream->SetOutputVolume(value);
+  g_settings.audio_output_volume = volume;
+  g_settings.audio_fast_forward_volume = fast_forward_volume;
 
-  g_settings.audio_output_volume = value;
+  if (m_audio_stream)
+    m_audio_stream->SetOutputVolume(GetAudioOutputVolume());
 }
 
 void QtHostInterface::setAudioOutputMuted(bool muted)
 {
   if (!isOnWorkerThread())
   {
-    QMetaObject::invokeMethod(this, "setAudioOutputMuted", Q_ARG(bool, muted));
+    QMetaObject::invokeMethod(this, "setAudioOutputMuted", Qt::QueuedConnection, Q_ARG(bool, muted));
     return;
   }
 
-  if (m_audio_stream)
-    m_audio_stream->SetOutputVolume(muted ? 0 : g_settings.audio_output_volume);
-
   g_settings.audio_output_muted = muted;
+
+  if (m_audio_stream)
+    m_audio_stream->SetOutputVolume(GetAudioOutputVolume());
 }
 
 void QtHostInterface::startDumpingAudio()
 {
   if (!isOnWorkerThread())
   {
-    QMetaObject::invokeMethod(this, "startDumpingAudio");
+    QMetaObject::invokeMethod(this, "startDumpingAudio", Qt::QueuedConnection);
     return;
   }
 
@@ -1036,23 +1282,35 @@ void QtHostInterface::stopDumpingAudio()
 {
   if (!isOnWorkerThread())
   {
-    QMetaObject::invokeMethod(this, "stopDumpingAudio");
+    QMetaObject::invokeMethod(this, "stopDumpingAudio", Qt::QueuedConnection);
     return;
   }
 
   StopDumpingAudio();
 }
 
+void QtHostInterface::singleStepCPU()
+{
+  if (!isOnWorkerThread())
+  {
+    QMetaObject::invokeMethod(this, "singleStepCPU", Qt::BlockingQueuedConnection);
+    return;
+  }
+
+  if (!System::IsValid())
+    return;
+
+  System::SingleStepCPU();
+  renderDisplay();
+}
+
 void QtHostInterface::dumpRAM(const QString& filename)
 {
   if (!isOnWorkerThread())
   {
-    QMetaObject::invokeMethod(this, "dumpRAM", Q_ARG(const QString&, filename));
+    QMetaObject::invokeMethod(this, "dumpRAM", Qt::QueuedConnection, Q_ARG(const QString&, filename));
     return;
   }
-
-  if (System::IsShutdown())
-    return;
 
   const std::string filename_str = filename.toStdString();
   if (System::DumpRAM(filename_str.c_str()))
@@ -1061,11 +1319,41 @@ void QtHostInterface::dumpRAM(const QString& filename)
     ReportFormattedMessage("Failed to dump RAM to '%s'", filename_str.c_str());
 }
 
+void QtHostInterface::dumpVRAM(const QString& filename)
+{
+  if (!isOnWorkerThread())
+  {
+    QMetaObject::invokeMethod(this, "dumpVRAM", Qt::QueuedConnection, Q_ARG(const QString&, filename));
+    return;
+  }
+
+  const std::string filename_str = filename.toStdString();
+  if (System::DumpVRAM(filename_str.c_str()))
+    ReportFormattedMessage("VRAM dumped to '%s'", filename_str.c_str());
+  else
+    ReportFormattedMessage("Failed to dump VRAM to '%s'", filename_str.c_str());
+}
+
+void QtHostInterface::dumpSPURAM(const QString& filename)
+{
+  if (!isOnWorkerThread())
+  {
+    QMetaObject::invokeMethod(this, "dumpSPURAM", Qt::QueuedConnection, Q_ARG(const QString&, filename));
+    return;
+  }
+
+  const std::string filename_str = filename.toStdString();
+  if (System::DumpSPURAM(filename_str.c_str()))
+    ReportFormattedMessage("SPU RAM dumped to '%s'", filename_str.c_str());
+  else
+    ReportFormattedMessage("Failed to dump SPU RAM to '%s'", filename_str.c_str());
+}
+
 void QtHostInterface::saveScreenshot()
 {
   if (!isOnWorkerThread())
   {
-    QMetaObject::invokeMethod(this, "saveScreenshot");
+    QMetaObject::invokeMethod(this, "saveScreenshot", Qt::QueuedConnection);
     return;
   }
 
@@ -1147,7 +1435,11 @@ void QtHostInterface::threadEntryPoint()
       continue;
     }
 
-    System::RunFrame();
+    if (m_display_all_frames)
+      System::RunFrame();
+    else
+      System::RunFrames();
+
     UpdateControllerRumble();
     if (m_frame_step_request)
     {
@@ -1159,7 +1451,7 @@ void QtHostInterface::threadEntryPoint()
 
     System::UpdatePerformanceCounters();
 
-    if (m_speed_limiter_enabled)
+    if (m_throttler_enabled)
       System::Throttle();
 
     m_worker_thread_event_loop->processEvents(QEventLoop::AllEvents);
@@ -1218,7 +1510,7 @@ static bool AddImGuiFont(const std::string& language, float size, float framebuf
   std::string path;
   const ImWchar* range = nullptr;
 #ifdef WIN32
-  if (language == "jp")
+  if (language == "ja")
   {
     path = GetFontPath("msgothic.ttc");
     range = ImGui::GetIO().Fonts->GetGlyphRangesJapanese();

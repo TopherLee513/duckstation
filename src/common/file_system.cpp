@@ -4,6 +4,7 @@
 #include "log.h"
 #include "string_util.h"
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
 
 #ifdef __APPLE__
@@ -19,6 +20,7 @@
 #else
 #include <dirent.h>
 #include <errno.h>
+#include <limits.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
@@ -75,6 +77,9 @@ void CanonicalizePath(char* Destination, u32 cbDestination, const char* Path, bo
           // remove the previous \, if we have one trailing the dot it'll append it anyway
           if (destinationLength > 0)
             Destination[--destinationLength] = '\0';
+          // if there was no previous \, skip past the next one
+          else if (nextCh != '\0')
+            i++;
 
           continue;
         }
@@ -109,7 +114,7 @@ void CanonicalizePath(char* Destination, u32 cbDestination, const char* Path, bo
 
     // fix ospath
     if (OSPath && (currentCh == '\\' || currentCh == '/'))
-      currentCh = FS_OSPATH_SEPERATOR_CHARACTER;
+      currentCh = FS_OSPATH_SEPARATOR_CHARACTER;
 
     // copy character
     if (destinationLength < cbDestination)
@@ -125,6 +130,10 @@ void CanonicalizePath(char* Destination, u32 cbDestination, const char* Path, bo
     // increment position by one
     i++;
   }
+
+  // if we end up with the empty string, return '.'
+  if (destinationLength == 0)
+    Destination[destinationLength++] = '.';
 
   // ensure nullptr termination
   if (destinationLength < cbDestination)
@@ -277,6 +286,59 @@ std::string GetPathDirectory(const char* path)
   std::string str;
   str.append(path, slash_ptr - path);
   return str;
+}
+
+std::string_view GetFileNameFromPath(const char* path)
+{
+  const char* end = path + std::strlen(path);
+  const char* start = std::max(std::strrchr(path, '/'), std::strrchr(path, '\\'));
+  if (!start)
+    return std::string_view(path, end - path);
+  else
+    return std::string_view(start + 1, end - start);
+}
+
+std::string_view GetFileTitleFromPath(const char* path)
+{
+  const char* end = path + std::strlen(path);
+  const char* extension = std::strrchr(path, '.');
+  if (extension && extension > path)
+    end = extension - 1;
+
+  const char* start = std::max(std::strrchr(path, '/'), std::strrchr(path, '\\'));
+  if (!start)
+    return std::string_view(path, end - path);
+  else if (start < end)
+    return std::string_view(start + 1, end - start);
+  else
+    return std::string_view(path);
+}
+
+std::vector<std::string> GetRootDirectoryList()
+{
+  std::vector<std::string> results;
+
+#ifdef WIN32
+  char buf[256];
+  if (GetLogicalDriveStringsA(sizeof(buf), buf) != 0)
+  {
+    const char* ptr = buf;
+    while (*ptr != '\0')
+    {
+      const std::size_t len = std::strlen(ptr);
+      results.emplace_back(ptr, len);
+      ptr += len + 1u;
+    }
+  }
+#else
+  const char* home_path = std::getenv("HOME");
+  if (home_path)
+    results.push_back(home_path);
+
+  results.push_back("/");
+#endif
+
+  return results;
 }
 
 void BuildPathRelativeToFile(char* Destination, u32 cbDestination, const char* CurrentFileName, const char* NewFileName,
@@ -496,6 +558,72 @@ bool WriteFileToString(const char* filename, const std::string_view& sv)
   return true;
 }
 
+std::string ReadStreamToString(ByteStream* stream, bool seek_to_start /* = true */)
+{
+  u64 pos = stream->GetPosition();
+  u64 size = stream->GetSize();
+  if (pos > 0 && seek_to_start)
+  {
+    if (!stream->SeekAbsolute(0))
+      return {};
+
+    pos = 0;
+  }
+
+  Assert(size >= pos);
+  size -= pos;
+  if (size == 0 || size > std::numeric_limits<u32>::max())
+    return {};
+
+  std::string ret;
+  ret.resize(static_cast<size_t>(size));
+  if (!stream->Read2(ret.data(), static_cast<u32>(size)))
+    return {};
+
+  return ret;
+}
+
+bool WriteStreamToString(const std::string_view& sv, ByteStream* stream)
+{
+  if (sv.size() > std::numeric_limits<u32>::max())
+    return false;
+
+  return stream->Write2(sv.data(), static_cast<u32>(sv.size()));
+}
+
+std::vector<u8> ReadBinaryStream(ByteStream* stream, bool seek_to_start /*= true*/)
+{
+  u64 pos = stream->GetPosition();
+  u64 size = stream->GetSize();
+  if (pos > 0 && seek_to_start)
+  {
+    if (!stream->SeekAbsolute(0))
+      return {};
+
+    pos = 0;
+  }
+
+  Assert(size >= pos);
+  size -= pos;
+  if (size == 0 || size > std::numeric_limits<u32>::max())
+    return {};
+
+  std::vector<u8> ret;
+  ret.resize(static_cast<size_t>(size));
+  if (!stream->Read2(ret.data(), static_cast<u32>(size)))
+    return {};
+
+  return ret;
+}
+
+bool WriteBinaryToSTream(ByteStream* stream, const void* data, size_t data_length)
+{
+  if (data_length > std::numeric_limits<u32>::max())
+    return false;
+
+  return stream->Write2(data, static_cast<u32>(data_length));
+}
+
 void BuildOSPath(char* Destination, u32 cbDestination, const char* Path)
 {
   u32 i;
@@ -507,7 +635,7 @@ void BuildOSPath(char* Destination, u32 cbDestination, const char* Path)
     for (i = 0; i < pathLength; i++)
     {
       if (Destination[i] == '/')
-        Destination[i] = FS_OSPATH_SEPERATOR_CHARACTER;
+        Destination[i] = FS_OSPATH_SEPARATOR_CHARACTER;
     }
   }
   else
@@ -516,7 +644,7 @@ void BuildOSPath(char* Destination, u32 cbDestination, const char* Path)
     pathLength = std::max(pathLength, cbDestination - 1);
     for (i = 0; i < pathLength; i++)
     {
-      Destination[i] = (Path[i] == '/') ? FS_OSPATH_SEPERATOR_CHARACTER : Path[i];
+      Destination[i] = (Path[i] == '/') ? FS_OSPATH_SEPARATOR_CHARACTER : Path[i];
     }
 
     Destination[pathLength] = '\0';
@@ -536,7 +664,7 @@ void BuildOSPath(String& Destination, const char* Path)
     for (i = 0; i < pathLength; i++)
     {
       if (Destination[i] == '/')
-        Destination[i] = FS_OSPATH_SEPERATOR_CHARACTER;
+        Destination[i] = FS_OSPATH_SEPARATOR_CHARACTER;
     }
   }
   else
@@ -546,7 +674,7 @@ void BuildOSPath(String& Destination, const char* Path)
     Destination.Resize(pathLength);
     for (i = 0; i < pathLength; i++)
     {
-      Destination[i] = (Path[i] == '/') ? FS_OSPATH_SEPERATOR_CHARACTER : Path[i];
+      Destination[i] = (Path[i] == '/') ? FS_OSPATH_SEPARATOR_CHARACTER : Path[i];
     }
   }
 }
@@ -920,15 +1048,27 @@ bool FileSystem::StatFile(const char* path, FILESYSTEM_STAT_DATA* pStatData)
   return true;
 }
 
-bool FileSystem::FileExists(const char* Path)
+bool FileSystem::FileExists(const char* path)
 {
   // has a path
-  if (Path[0] == '\0')
+  if (path[0] == '\0')
     return false;
 
+  // convert to wide string
+  int len = static_cast<int>(std::strlen(path));
+  int wlen = MultiByteToWideChar(CP_UTF8, 0, path, len, nullptr, 0);
+  if (wlen <= 0)
+    return false;
+
+  wchar_t* wpath = static_cast<wchar_t*>(alloca(sizeof(wchar_t) * (wlen + 1)));
+  wlen = MultiByteToWideChar(CP_UTF8, 0, path, len, wpath, wlen);
+  if (wlen <= 0)
+    return false;
+
+  wpath[wlen] = 0;
+
   // determine attributes for the path. if it's a directory, things have to be handled differently..
-  std::wstring wpath(StringUtil::UTF8StringToWideString(Path));
-  DWORD fileAttributes = GetFileAttributesW(wpath.c_str());
+  DWORD fileAttributes = GetFileAttributesW(wpath);
   if (fileAttributes == INVALID_FILE_ATTRIBUTES)
     return false;
 
@@ -938,15 +1078,27 @@ bool FileSystem::FileExists(const char* Path)
     return true;
 }
 
-bool FileSystem::DirectoryExists(const char* Path)
+bool FileSystem::DirectoryExists(const char* path)
 {
   // has a path
-  if (Path[0] == '\0')
+  if (path[0] == '\0')
     return false;
 
+  // convert to wide string
+  int len = static_cast<int>(std::strlen(path));
+  int wlen = MultiByteToWideChar(CP_UTF8, 0, path, len, nullptr, 0);
+  if (wlen <= 0)
+    return false;
+
+  wchar_t* wpath = static_cast<wchar_t*>(alloca(sizeof(wchar_t) * (wlen + 1)));
+  wlen = MultiByteToWideChar(CP_UTF8, 0, path, len, wpath, wlen);
+  if (wlen <= 0)
+    return false;
+
+  wpath[wlen] = 0;
+
   // determine attributes for the path. if it's a directory, things have to be handled differently..
-  std::wstring wpath(StringUtil::UTF8StringToWideString(Path));
-  DWORD fileAttributes = GetFileAttributesW(wpath.c_str());
+  DWORD fileAttributes = GetFileAttributesW(wpath);
   if (fileAttributes == INVALID_FILE_ATTRIBUTES)
     return false;
 
@@ -1114,16 +1266,18 @@ bool FileSystem::DeleteDirectory(const char* Path, bool Recursive)
 
 std::string GetProgramPath()
 {
-  const HANDLE hProcess = GetCurrentProcess();
-
   std::wstring buffer;
   buffer.resize(MAX_PATH);
 
+  // Fall back to the main module if this fails.
+  HMODULE module = nullptr;
+  GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                     reinterpret_cast<LPCWSTR>(&GetProgramPath), &module);
+
   for (;;)
   {
-    DWORD nChars = static_cast<DWORD>(buffer.size());
-    if (!QueryFullProcessImageNameW(GetCurrentProcess(), 0, buffer.data(), &nChars) &&
-        GetLastError() == ERROR_INSUFFICIENT_BUFFER)
+    DWORD nChars = GetModuleFileNameW(module, buffer.data(), static_cast<DWORD>(buffer.size()));
+    if (nChars == static_cast<DWORD>(buffer.size()) && GetLastError() == ERROR_INSUFFICIENT_BUFFER)
     {
       buffer.resize(buffer.size() * 2);
       continue;
@@ -1198,6 +1352,7 @@ static u32 RecursiveFindFiles(const char* OriginPath, const char* ParentPath, co
   }
 
   // iterate results
+  PathString full_path;
   struct dirent* pDirEnt;
   while ((pDirEnt = readdir(pDir)) != nullptr)
   {
@@ -1213,17 +1368,28 @@ static u32 RecursiveFindFiles(const char* OriginPath, const char* ParentPath, co
         continue;
     }
 
+    if (ParentPath != nullptr)
+      full_path.Format("%s/%s/%s/%s", OriginPath, ParentPath, Path, pDirEnt->d_name);
+    else if (Path != nullptr)
+      full_path.Format("%s/%s/%s", OriginPath, Path, pDirEnt->d_name);
+    else
+      full_path.Format("%s/%s", OriginPath, pDirEnt->d_name);
+
     FILESYSTEM_FIND_DATA outData;
     outData.Attributes = 0;
 
-#ifdef __HAIKU__
+#if defined(__HAIKU__) || defined(__APPLE__)
     struct stat sDir;
+    if (stat(full_path, &sDir) < 0)
+      continue;
 
-    stat(pDirEnt->d_name, &sDir);
-    if (S_ISDIR(sDir.st_mode))
 #else
-    if (pDirEnt->d_type == DT_DIR)
+    struct stat64 sDir;
+    if (stat64(full_path, &sDir) < 0)
+      continue;
 #endif
+
+    if (S_ISDIR(sDir.st_mode))
     {
       if (Flags & FILESYSTEM_FIND_RECURSIVE)
       {
@@ -1250,8 +1416,8 @@ static u32 RecursiveFindFiles(const char* OriginPath, const char* ParentPath, co
         continue;
     }
 
-    //        if (wfd.dwFileAttributes & FILE_ATTRIBUTE_READONLY)
-    //            outData.Attributes |= FILESYSTEM_FILE_ATTRIBUTE_READ_ONLY;
+    outData.Size = static_cast<u64>(sDir.st_size);
+    outData.ModificationTime.SetUnixTimestamp(static_cast<Timestamp::UnixTimestampValue>(sDir.st_mtime));
 
     // match the filename
     if (hasWildCards)
@@ -1269,13 +1435,7 @@ static u32 RecursiveFindFiles(const char* OriginPath, const char* ParentPath, co
     // TODO string formatter, clean this mess..
     if (!(Flags & FILESYSTEM_FIND_RELATIVE_PATHS))
     {
-      if (ParentPath != nullptr)
-        outData.FileName =
-          StringUtil::StdStringFromFormat("%s/%s/%s/%s", OriginPath, ParentPath, Path, pDirEnt->d_name);
-      else if (Path != nullptr)
-        outData.FileName = StringUtil::StdStringFromFormat("%s/%s/%s", OriginPath, Path, pDirEnt->d_name);
-      else
-        outData.FileName = StringUtil::StdStringFromFormat("%s/%s", OriginPath, pDirEnt->d_name);
+      outData.FileName = std::string(full_path.GetCharArray());
     }
     else
     {
@@ -1315,8 +1475,8 @@ bool StatFile(const char* Path, FILESYSTEM_STAT_DATA* pStatData)
   if (Path[0] == '\0')
     return false;
 
-  // stat file
-#ifdef __HAIKU__
+    // stat file
+#if defined(__HAIKU__) || defined(__APPLE__)
   struct stat sysStatData;
   if (stat(Path, &sysStatData) < 0)
 #else
@@ -1349,8 +1509,8 @@ bool FileExists(const char* Path)
   if (Path[0] == '\0')
     return false;
 
-  // stat file
-#ifdef __HAIKU__
+    // stat file
+#if defined(__HAIKU__) || defined(__APPLE__)
   struct stat sysStatData;
   if (stat(Path, &sysStatData) < 0)
 #else
@@ -1371,13 +1531,13 @@ bool DirectoryExists(const char* Path)
   if (Path[0] == '\0')
     return false;
 
-  // stat file
-#ifdef __HAIKU__
-    struct stat sysStatData;
-    if (stat(Path, &sysStatData) < 0)
+    // stat file
+#if defined(__HAIKU__) || defined(__APPLE__)
+  struct stat sysStatData;
+  if (stat(Path, &sysStatData) < 0)
 #else
-    struct stat64 sysStatData;
-    if (stat64(Path, &sysStatData) < 0)
+  struct stat64 sysStatData;
+  if (stat64(Path, &sysStatData) < 0)
 #endif
     return false;
 

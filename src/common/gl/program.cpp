@@ -192,6 +192,18 @@ void Program::BindFragData(GLuint index /*= 0*/, const char* name /*= "o_col0"*/
 
 void Program::BindFragDataIndexed(GLuint color_number /*= 0*/, const char* name /*= "o_col0"*/)
 {
+  if (GLAD_GL_VERSION_3_3 || GLAD_GL_ARB_blend_func_extended)
+  {
+    glBindFragDataLocationIndexed(m_program_id, color_number, 0, name);
+    return;
+  }
+  else if (GLAD_GL_EXT_blend_func_extended)
+  {
+    glBindFragDataLocationIndexedEXT(m_program_id, color_number, 0, name);
+    return;
+  }
+
+  Log_ErrorPrintf("BindFragDataIndexed() called without ARB or EXT extension, we'll probably crash.");
   glBindFragDataLocationIndexed(m_program_id, color_number, 0, name);
 }
 
@@ -199,9 +211,11 @@ bool Program::Link()
 {
   glLinkProgram(m_program_id);
 
-  glDeleteShader(m_vertex_shader_id);
+  if (m_vertex_shader_id != 0)
+    glDeleteShader(m_vertex_shader_id);
   m_vertex_shader_id = 0;
-  glDeleteShader(m_fragment_shader_id);
+  if (m_fragment_shader_id != 0)
+    glDeleteShader(m_fragment_shader_id);
   m_fragment_shader_id = 0;
 
   GLint status = GL_FALSE;

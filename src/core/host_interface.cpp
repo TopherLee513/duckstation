@@ -16,13 +16,19 @@
 #include "host_display.h"
 #include "pgxp.h"
 #include "save_state_version.h"
+#include "spu.h"
 #include "system.h"
+#include "texture_replacements.h"
 #include <cmath>
 #include <cstring>
 #include <cwchar>
-#include <imgui.h>
 #include <stdlib.h>
 Log_SetChannel(HostInterface);
+
+#ifdef _WIN32
+#include "common/windows_headers.h"
+#include <dwmapi.h>
+#endif
 
 HostInterface* g_host_interface;
 
@@ -49,7 +55,11 @@ bool HostInterface::Initialize()
   return true;
 }
 
-void HostInterface::Shutdown() {}
+void HostInterface::Shutdown()
+{
+  if (!System::IsShutdown())
+    System::Shutdown();
+}
 
 void HostInterface::CreateAudioStream()
 {
@@ -59,15 +69,24 @@ void HostInterface::CreateAudioStream()
 
   m_audio_stream = CreateAudioStream(g_settings.audio_backend);
 
-  if (!m_audio_stream || !m_audio_stream->Reconfigure(AUDIO_SAMPLE_RATE, AUDIO_CHANNELS, g_settings.audio_buffer_size))
+  if (!m_audio_stream ||
+      !m_audio_stream->Reconfigure(AUDIO_SAMPLE_RATE, AUDIO_SAMPLE_RATE, AUDIO_CHANNELS, g_settings.audio_buffer_size))
   {
     ReportFormattedError("Failed to create or configure audio stream, falling back to null output.");
     m_audio_stream.reset();
     m_audio_stream = AudioStream::CreateNullAudioStream();
-    m_audio_stream->Reconfigure(AUDIO_SAMPLE_RATE, AUDIO_CHANNELS, g_settings.audio_buffer_size);
+    m_audio_stream->Reconfigure(AUDIO_SAMPLE_RATE, AUDIO_SAMPLE_RATE, AUDIO_CHANNELS, g_settings.audio_buffer_size);
   }
 
-  m_audio_stream->SetOutputVolume(g_settings.audio_output_muted ? 0 : g_settings.audio_output_volume);
+  m_audio_stream->SetOutputVolume(GetAudioOutputVolume());
+
+  if (System::IsValid())
+    g_spu.SetAudioStream(m_audio_stream.get());
+}
+
+s32 HostInterface::GetAudioOutputVolume() const
+{
+  return g_settings.audio_output_muted ? 0 : g_settings.audio_output_volume;
 }
 
 bool HostInterface::BootSystem(const SystemBootParameters& parameters)
@@ -122,6 +141,22 @@ void HostInterface::PowerOffSystem()
   DestroySystem();
 }
 
+void HostInterface::PauseSystem(bool paused)
+{
+  if (paused == System::IsPaused() || System::IsShutdown())
+    return;
+
+  System::SetState(paused ? System::State::Paused : System::State::Running);
+  if (!paused)
+    m_audio_stream->EmptyBuffers();
+  m_audio_stream->PauseOutput(paused);
+
+  OnSystemPaused(paused);
+
+  if (!paused)
+    System::ResetPerformanceCounters();
+}
+
 void HostInterface::DestroySystem()
 {
   if (System::IsShutdown())
@@ -142,7 +177,12 @@ void HostInterface::ReportError(const char* message)
 
 void HostInterface::ReportMessage(const char* message)
 {
-  Log_InfoPrintf(message);
+  Log_InfoPrint(message);
+}
+
+void HostInterface::ReportDebuggerMessage(const char* message)
+{
+  Log_InfoPrintf("(Debugger) %s", message);
 }
 
 bool HostInterface::ConfirmMessage(const char* message)
@@ -171,6 +211,16 @@ void HostInterface::ReportFormattedMessage(const char* format, ...)
   ReportMessage(message.c_str());
 }
 
+void HostInterface::ReportFormattedDebuggerMessage(const char* format, ...)
+{
+  std::va_list ap;
+  va_start(ap, format);
+  std::string message = StringUtil::StdStringFromFormatV(format, ap);
+  va_end(ap);
+
+  ReportDebuggerMessage(message.c_str());
+}
+
 bool HostInterface::ConfirmFormattedMessage(const char* format, ...)
 {
   std::va_list ap;
@@ -196,86 +246,162 @@ void HostInterface::AddFormattedOSDMessage(float duration, const char* format, .
   AddOSDMessage(std::move(message), duration);
 }
 
+std::string HostInterface::GetBIOSDirectory()
+{
+  std::string dir = GetStringSettingValue("BIOS", "SearchDirectory", "");
+  if (!dir.empty())
+    return dir;
+
+  return GetUserDirectoryRelativePath("bios");
+}
+
 std::optional<std::vector<u8>> HostInterface::GetBIOSImage(ConsoleRegion region)
 {
-  // Try the other default filenames in the directory of the configured BIOS.
-#define TRY_FILENAME(filename)                                                                                         \
-  do                                                                                                                   \
-  {                                                                                                                    \
-    String try_filename = filename;                                                                                    \
-    std::optional<BIOS::Image> found_image = BIOS::LoadImageFromFile(try_filename.GetCharArray());                     \
-    if (found_image)                                                                                                   \
-    {                                                                                                                  \
-      BIOS::Hash found_hash = BIOS::GetHash(*found_image);                                                             \
-      Log_DevPrintf("Hash for BIOS '%s': %s", try_filename.GetCharArray(), found_hash.ToString().c_str());             \
-      if (BIOS::IsValidHashForRegion(region, found_hash))                                                              \
-      {                                                                                                                \
-        Log_InfoPrintf("Using BIOS from '%s' for region '%s'", try_filename.GetCharArray(),                            \
-                       Settings::GetConsoleRegionName(region));                                                        \
-        return found_image;                                                                                            \
-      }                                                                                                                \
-    }                                                                                                                  \
-  } while (0)
-
-  // Try the configured image.
-  TRY_FILENAME(g_settings.bios_path.c_str());
-
-  // Try searching in the same folder for other region's images.
+  std::string bios_dir = GetBIOSDirectory();
+  std::string bios_name;
   switch (region)
   {
     case ConsoleRegion::NTSC_J:
-      TRY_FILENAME(FileSystem::BuildPathRelativeToFile(g_settings.bios_path.c_str(), "scph3000.bin", false, false));
-      TRY_FILENAME(FileSystem::BuildPathRelativeToFile(g_settings.bios_path.c_str(), "ps-11j.bin", false, false));
-      TRY_FILENAME(FileSystem::BuildPathRelativeToFile(g_settings.bios_path.c_str(), "scph1000.bin", false, false));
-      TRY_FILENAME(FileSystem::BuildPathRelativeToFile(g_settings.bios_path.c_str(), "ps-10j.bin", false, false));
-      TRY_FILENAME(FileSystem::BuildPathRelativeToFile(g_settings.bios_path.c_str(), "scph5500.bin", false, false));
-      TRY_FILENAME(FileSystem::BuildPathRelativeToFile(g_settings.bios_path.c_str(), "ps-30j.bin", false, false));
-      TRY_FILENAME(FileSystem::BuildPathRelativeToFile(g_settings.bios_path.c_str(), "scph7000.bin", false, false));
-      TRY_FILENAME(FileSystem::BuildPathRelativeToFile(g_settings.bios_path.c_str(), "scph7500.bin", false, false));
-      TRY_FILENAME(FileSystem::BuildPathRelativeToFile(g_settings.bios_path.c_str(), "scph9000.bin", false, false));
-      TRY_FILENAME(FileSystem::BuildPathRelativeToFile(g_settings.bios_path.c_str(), "ps-40j.bin", false, false));
-      break;
-
-    case ConsoleRegion::NTSC_U:
-      TRY_FILENAME(FileSystem::BuildPathRelativeToFile(g_settings.bios_path.c_str(), "scph1001.bin", false, false));
-      TRY_FILENAME(FileSystem::BuildPathRelativeToFile(g_settings.bios_path.c_str(), "ps-22a.bin", false, false));
-      TRY_FILENAME(FileSystem::BuildPathRelativeToFile(g_settings.bios_path.c_str(), "scph5501.bin", false, false));
-      TRY_FILENAME(FileSystem::BuildPathRelativeToFile(g_settings.bios_path.c_str(), "scph5503.bin", false, false));
-      TRY_FILENAME(FileSystem::BuildPathRelativeToFile(g_settings.bios_path.c_str(), "scph7003.bin", false, false));
-      TRY_FILENAME(FileSystem::BuildPathRelativeToFile(g_settings.bios_path.c_str(), "ps-30a.bin", false, false));
-      TRY_FILENAME(FileSystem::BuildPathRelativeToFile(g_settings.bios_path.c_str(), "scph7001.bin", false, false));
-      TRY_FILENAME(FileSystem::BuildPathRelativeToFile(g_settings.bios_path.c_str(), "scph7501.bin", false, false));
-      TRY_FILENAME(FileSystem::BuildPathRelativeToFile(g_settings.bios_path.c_str(), "scph7503.bin", false, false));
-      TRY_FILENAME(FileSystem::BuildPathRelativeToFile(g_settings.bios_path.c_str(), "scph9001.bin", false, false));
-      TRY_FILENAME(FileSystem::BuildPathRelativeToFile(g_settings.bios_path.c_str(), "scph9003.bin", false, false));
-      TRY_FILENAME(FileSystem::BuildPathRelativeToFile(g_settings.bios_path.c_str(), "scph9903.bin", false, false));
-      TRY_FILENAME(FileSystem::BuildPathRelativeToFile(g_settings.bios_path.c_str(), "ps-41a.bin", false, false));
+      bios_name = GetStringSettingValue("BIOS", "PathNTSCJ", "");
       break;
 
     case ConsoleRegion::PAL:
-      TRY_FILENAME(FileSystem::BuildPathRelativeToFile(g_settings.bios_path.c_str(), "scph1002.bin", false, false));
-      TRY_FILENAME(FileSystem::BuildPathRelativeToFile(g_settings.bios_path.c_str(), "ps-21e.bin", false, false));
-      TRY_FILENAME(FileSystem::BuildPathRelativeToFile(g_settings.bios_path.c_str(), "scph5502.bin", false, false));
-      TRY_FILENAME(FileSystem::BuildPathRelativeToFile(g_settings.bios_path.c_str(), "scph5552.bin", false, false));
-      TRY_FILENAME(FileSystem::BuildPathRelativeToFile(g_settings.bios_path.c_str(), "ps-30e.bin", false, false));
-      TRY_FILENAME(FileSystem::BuildPathRelativeToFile(g_settings.bios_path.c_str(), "scph7002.bin", false, false));
-      TRY_FILENAME(FileSystem::BuildPathRelativeToFile(g_settings.bios_path.c_str(), "scph7502.bin", false, false));
-      TRY_FILENAME(FileSystem::BuildPathRelativeToFile(g_settings.bios_path.c_str(), "scph9002.bin", false, false));
-      TRY_FILENAME(FileSystem::BuildPathRelativeToFile(g_settings.bios_path.c_str(), "ps-41e.bin", false, false));
+      bios_name = GetStringSettingValue("BIOS", "PathPAL", "");
       break;
 
+    case ConsoleRegion::NTSC_U:
     default:
+      bios_name = GetStringSettingValue("BIOS", "PathNTSCU", "");
       break;
   }
 
-#undef RELATIVE_PATH
-#undef TRY_FILENAME
+  if (bios_name.empty())
+  {
+    // auto-detect
+    return FindBIOSImageInDirectory(region, bios_dir.c_str());
+  }
 
-  // Fall back to the default image.
-  Log_WarningPrintf("No suitable BIOS image for region %s could be located, using configured image '%s'. This may "
-                    "result in instability.",
-                    Settings::GetConsoleRegionName(region), g_settings.bios_path.c_str());
-  return BIOS::LoadImageFromFile(g_settings.bios_path);
+  // try the configured path
+  std::optional<BIOS::Image> image = BIOS::LoadImageFromFile(
+    StringUtil::StdStringFromFormat("%s" FS_OSPATH_SEPARATOR_STR "%s", bios_dir.c_str(), bios_name.c_str()).c_str());
+  if (!image.has_value())
+  {
+    g_host_interface->ReportFormattedError(
+      g_host_interface->TranslateString("HostInterface", "Failed to load configured BIOS file '%s'"),
+      bios_name.c_str());
+    return std::nullopt;
+  }
+
+  BIOS::Hash found_hash = BIOS::GetHash(*image);
+  Log_DevPrintf("Hash for BIOS '%s': %s", bios_name.c_str(), found_hash.ToString().c_str());
+
+  if (!BIOS::IsValidHashForRegion(region, found_hash))
+    Log_WarningPrintf("Hash for BIOS '%s' does not match region. This may cause issues.", bios_name.c_str());
+
+  return image;
+}
+
+std::optional<std::vector<u8>> HostInterface::FindBIOSImageInDirectory(ConsoleRegion region, const char* directory)
+{
+  Log_InfoPrintf("Searching for a %s BIOS in '%s'...", Settings::GetConsoleRegionDisplayName(region), directory);
+
+  FileSystem::FindResultsArray results;
+  FileSystem::FindFiles(
+    directory, "*", FILESYSTEM_FIND_FILES | FILESYSTEM_FIND_HIDDEN_FILES | FILESYSTEM_FIND_RELATIVE_PATHS, &results);
+
+  std::string fallback_path;
+  std::optional<BIOS::Image> fallback_image;
+  const BIOS::ImageInfo* fallback_info = nullptr;
+
+  for (const FILESYSTEM_FIND_DATA& fd : results)
+  {
+    if (fd.Size != BIOS::BIOS_SIZE && fd.Size != BIOS::BIOS_SIZE_PS2 && fd.Size != BIOS::BIOS_SIZE_PS3)
+    {
+      Log_WarningPrintf("Skipping '%s': incorrect size", fd.FileName.c_str());
+      continue;
+    }
+
+    std::string full_path(
+      StringUtil::StdStringFromFormat("%s" FS_OSPATH_SEPARATOR_STR "%s", directory, fd.FileName.c_str()));
+
+    std::optional<BIOS::Image> found_image = BIOS::LoadImageFromFile(full_path.c_str());
+    if (!found_image)
+      continue;
+
+    BIOS::Hash found_hash = BIOS::GetHash(*found_image);
+    Log_DevPrintf("Hash for BIOS '%s': %s", fd.FileName.c_str(), found_hash.ToString().c_str());
+
+    const BIOS::ImageInfo* ii = BIOS::GetImageInfoForHash(found_hash);
+
+    if (BIOS::IsValidHashForRegion(region, found_hash))
+    {
+      Log_InfoPrintf("Using BIOS '%s': %s", fd.FileName.c_str(), ii ? ii->description : "");
+      return found_image;
+    }
+
+    // don't let an unknown bios take precedence over a known one
+    if (!fallback_path.empty() && (fallback_info || !ii))
+      continue;
+
+    fallback_path = std::move(full_path);
+    fallback_image = std::move(found_image);
+    fallback_info = ii;
+  }
+
+  if (!fallback_image.has_value())
+  {
+    g_host_interface->ReportFormattedError(
+      g_host_interface->TranslateString("HostInterface", "No BIOS image found for %s region"),
+      Settings::GetConsoleRegionDisplayName(region));
+    return std::nullopt;
+  }
+
+  if (!fallback_info)
+  {
+    Log_WarningPrintf("Using unknown BIOS '%s'. This may crash.", fallback_path.c_str());
+  }
+  else
+  {
+    Log_WarningPrintf("Falling back to possibly-incompatible image '%s': %s", fallback_path.c_str(),
+                      fallback_info->description);
+  }
+
+  return fallback_image;
+}
+
+std::vector<std::pair<std::string, const BIOS::ImageInfo*>>
+HostInterface::FindBIOSImagesInDirectory(const char* directory)
+{
+  std::vector<std::pair<std::string, const BIOS::ImageInfo*>> results;
+
+  FileSystem::FindResultsArray files;
+  FileSystem::FindFiles(directory, "*",
+                        FILESYSTEM_FIND_FILES | FILESYSTEM_FIND_HIDDEN_FILES | FILESYSTEM_FIND_RELATIVE_PATHS, &files);
+
+  for (FILESYSTEM_FIND_DATA& fd : files)
+  {
+    if (fd.Size != BIOS::BIOS_SIZE && fd.Size != BIOS::BIOS_SIZE_PS2 && fd.Size != BIOS::BIOS_SIZE_PS3)
+      continue;
+
+    std::string full_path(
+      StringUtil::StdStringFromFormat("%s" FS_OSPATH_SEPARATOR_STR "%s", directory, fd.FileName.c_str()));
+
+    std::optional<BIOS::Image> found_image = BIOS::LoadImageFromFile(full_path.c_str());
+    if (!found_image)
+      continue;
+
+    BIOS::Hash found_hash = BIOS::GetHash(*found_image);
+    const BIOS::ImageInfo* ii = BIOS::GetImageInfoForHash(found_hash);
+    results.emplace_back(std::move(fd.FileName), ii);
+  }
+
+  return results;
+}
+
+bool HostInterface::HasAnyBIOSImages()
+{
+  const std::string dir = GetBIOSDirectory();
+  return (FindBIOSImageInDirectory(ConsoleRegion::Auto, dir.c_str()).has_value());
 }
 
 bool HostInterface::LoadState(const char* filename)
@@ -332,6 +458,8 @@ bool HostInterface::SaveState(const char* filename)
 
 void HostInterface::OnSystemCreated() {}
 
+void HostInterface::OnSystemPaused(bool paused) {}
+
 void HostInterface::OnSystemDestroyed() {}
 
 void HostInterface::OnSystemPerformanceCountersUpdated() {}
@@ -352,39 +480,64 @@ void HostInterface::SetDefaultSettings(SettingsInterface& si)
   si.SetStringValue("Console", "Region", Settings::GetConsoleRegionName(Settings::DEFAULT_CONSOLE_REGION));
 
   si.SetFloatValue("Main", "EmulationSpeed", 1.0f);
-  si.SetBoolValue("Main", "SpeedLimiterEnabled", true);
+  si.SetFloatValue("Main", "FastForwardSpeed", 0.0f);
+  si.SetFloatValue("Main", "TurboSpeed", 0.0f);
+  si.SetBoolValue("Main", "SyncToHostRefreshRate", false);
   si.SetBoolValue("Main", "IncreaseTimerResolution", true);
   si.SetBoolValue("Main", "StartPaused", false);
+  si.SetBoolValue("Main", "StartFullscreen", false);
+  si.SetBoolValue("Main", "PauseOnFocusLoss", false);
   si.SetBoolValue("Main", "SaveStateOnExit", true);
   si.SetBoolValue("Main", "ConfirmPowerOff", true);
   si.SetBoolValue("Main", "LoadDevicesFromSaveStates", false);
   si.SetBoolValue("Main", "ApplyGameSettings", true);
+  si.SetBoolValue("Main", "DisableAllEnhancements", false);
+  si.SetBoolValue("Main", "RewindEnable", false);
+  si.SetFloatValue("Main", "RewindFrequency", 10.0f);
+  si.SetIntValue("Main", "RewindSaveSlots", 10);
+  si.SetFloatValue("Main", "RunaheadFrameCount", 0);
 
   si.SetStringValue("CPU", "ExecutionMode", Settings::GetCPUExecutionModeName(Settings::DEFAULT_CPU_EXECUTION_MODE));
   si.SetBoolValue("CPU", "RecompilerMemoryExceptions", false);
+  si.SetBoolValue("CPU", "ICache", false);
+  si.SetBoolValue("CPU", "FastmemMode", Settings::GetCPUFastmemModeName(Settings::DEFAULT_CPU_FASTMEM_MODE));
 
   si.SetStringValue("GPU", "Renderer", Settings::GetRendererName(Settings::DEFAULT_GPU_RENDERER));
   si.SetIntValue("GPU", "ResolutionScale", 1);
+  si.SetIntValue("GPU", "Multisamples", 1);
   si.SetBoolValue("GPU", "UseDebugDevice", false);
+  si.SetBoolValue("GPU", "PerSampleShading", false);
+  si.SetBoolValue("GPU", "UseThread", true);
+  si.SetBoolValue("GPU", "ThreadedPresentation", true);
   si.SetBoolValue("GPU", "TrueColor", false);
   si.SetBoolValue("GPU", "ScaledDithering", true);
-  si.SetBoolValue("GPU", "TextureFiltering", false);
-  si.SetBoolValue("GPU", "DisableInterlacing", false);
+  si.SetStringValue("GPU", "TextureFilter", Settings::GetTextureFilterName(Settings::DEFAULT_GPU_TEXTURE_FILTER));
+  si.SetStringValue("GPU", "DownsampleMode", Settings::GetDownsampleModeName(Settings::DEFAULT_GPU_DOWNSAMPLE_MODE));
+  si.SetBoolValue("GPU", "DisableInterlacing", true);
   si.SetBoolValue("GPU", "ForceNTSCTimings", false);
   si.SetBoolValue("GPU", "WidescreenHack", false);
+  si.SetBoolValue("GPU", "ChromaSmoothing24Bit", false);
   si.SetBoolValue("GPU", "PGXPEnable", false);
   si.SetBoolValue("GPU", "PGXPCulling", true);
   si.SetBoolValue("GPU", "PGXPTextureCorrection", true);
   si.SetBoolValue("GPU", "PGXPVertexCache", false);
   si.SetBoolValue("GPU", "PGXPCPU", false);
+  si.SetBoolValue("GPU", "PGXPPreserveProjFP", false);
+  si.SetFloatValue("GPU", "PGXPTolerance", -1.0f);
+  si.SetBoolValue("GPU", "PGXPDepthBuffer", false);
+  si.SetFloatValue("GPU", "PGXPDepthClearThreshold", Settings::DEFAULT_GPU_PGXP_DEPTH_THRESHOLD);
 
   si.SetStringValue("Display", "CropMode", Settings::GetDisplayCropModeName(Settings::DEFAULT_DISPLAY_CROP_MODE));
-  si.SetIntValue("Display", "OverscanActiveStartOffset", 0);
-  si.SetIntValue("Display", "OverscanActiveEndOffset", 0);
+  si.SetIntValue("Display", "ActiveStartOffset", 0);
+  si.SetIntValue("Display", "ActiveEndOffset", 0);
+  si.SetIntValue("Display", "LineStartOffset", 0);
+  si.SetIntValue("Display", "LineEndOffset", 0);
   si.SetStringValue("Display", "AspectRatio",
                     Settings::GetDisplayAspectRatioName(Settings::DEFAULT_DISPLAY_ASPECT_RATIO));
+  si.SetBoolValue("Display", "Force4_3For24Bit", false);
   si.SetBoolValue("Display", "LinearFiltering", true);
   si.SetBoolValue("Display", "IntegerScaling", false);
+  si.SetBoolValue("Display", "PostProcessing", false);
   si.SetBoolValue("Display", "ShowOSDMessages", true);
   si.SetBoolValue("Display", "ShowFPS", false);
   si.SetBoolValue("Display", "ShowVPS", false);
@@ -392,19 +545,29 @@ void HostInterface::SetDefaultSettings(SettingsInterface& si)
   si.SetBoolValue("Display", "ShowResolution", false);
   si.SetBoolValue("Display", "Fullscreen", false);
   si.SetBoolValue("Display", "VSync", true);
+  si.SetBoolValue("Display", "DisplayAllFrames", false);
+  si.SetStringValue("Display", "PostProcessChain", "");
+  si.SetFloatValue("Display", "MaxFPS", 0.0f);
 
   si.SetBoolValue("CDROM", "ReadThread", true);
   si.SetBoolValue("CDROM", "RegionCheck", true);
   si.SetBoolValue("CDROM", "LoadImageToRAM", false);
+  si.SetBoolValue("CDROM", "MuteCDAudio", false);
+  si.SetIntValue("CDROM", "ReadSpeedup", 1);
 
   si.SetStringValue("Audio", "Backend", Settings::GetAudioBackendName(Settings::DEFAULT_AUDIO_BACKEND));
   si.SetIntValue("Audio", "OutputVolume", 100);
+  si.SetIntValue("Audio", "FastForwardVolume", 100);
   si.SetIntValue("Audio", "BufferSize", DEFAULT_AUDIO_BUFFER_SIZE);
+  si.SetBoolValue("Audio", "Resampling", true);
   si.SetIntValue("Audio", "OutputMuted", false);
   si.SetBoolValue("Audio", "Sync", true);
   si.SetBoolValue("Audio", "DumpOnBoot", false);
 
-  si.SetStringValue("BIOS", "Path", "bios/scph1001.bin");
+  si.SetStringValue("BIOS", "SearchDirectory", "");
+  si.SetStringValue("BIOS", "PathNTSCU", "");
+  si.SetStringValue("BIOS", "PathNTSCJ", "");
+  si.SetStringValue("BIOS", "PathPAL", "");
   si.SetBoolValue("BIOS", "PatchTTYEnable", false);
   si.SetBoolValue("BIOS", "PatchFastBoot", false);
 
@@ -412,9 +575,9 @@ void HostInterface::SetDefaultSettings(SettingsInterface& si)
   si.SetStringValue("Controller2", "Type", Settings::GetControllerTypeName(Settings::DEFAULT_CONTROLLER_2_TYPE));
 
   si.SetStringValue("MemoryCards", "Card1Type", Settings::GetMemoryCardTypeName(Settings::DEFAULT_MEMORY_CARD_1_TYPE));
-  si.SetStringValue("MemoryCards", "Card1Path", "memcards/shared_card_1.mcd");
+  si.SetStringValue("MemoryCards", "Card1Path", "memcards" FS_OSPATH_SEPARATOR_STR "shared_card_1.mcd");
   si.SetStringValue("MemoryCards", "Card2Type", Settings::GetMemoryCardTypeName(Settings::DEFAULT_MEMORY_CARD_2_TYPE));
-  si.SetStringValue("MemoryCards", "Card2Path", "memcards/shared_card_2.mcd");
+  si.SetStringValue("MemoryCards", "Card2Path", "memcards" FS_OSPATH_SEPARATOR_STR "shared_card_2.mcd");
   si.SetBoolValue("MemoryCards", "UsePlaylistTitle", true);
 
   si.SetStringValue("Logging", "LogLevel", Settings::GetLogLevelName(Settings::DEFAULT_LOG_LEVEL));
@@ -432,6 +595,7 @@ void HostInterface::SetDefaultSettings(SettingsInterface& si)
   si.SetBoolValue("Debug", "ShowSPUState", false);
   si.SetBoolValue("Debug", "ShowTimersState", false);
   si.SetBoolValue("Debug", "ShowMDECState", false);
+  si.SetBoolValue("Debug", "ShowDMAState", false);
 
   si.SetIntValue("Hacks", "DMAMaxSliceTicks", static_cast<int>(Settings::DEFAULT_DMA_MAX_SLICE_TICKS));
   si.SetIntValue("Hacks", "DMAHaltTicks", static_cast<int>(Settings::DEFAULT_DMA_HALT_TICKS));
@@ -446,13 +610,43 @@ void HostInterface::LoadSettings(SettingsInterface& si)
 
 void HostInterface::FixIncompatibleSettings(bool display_osd_messages)
 {
+  if (g_settings.disable_all_enhancements)
+  {
+    Log_WarningPrintf("All enhancements disabled by config setting.");
+    g_settings.cpu_overclock_enable = false;
+    g_settings.cpu_overclock_active = false;
+    g_settings.gpu_resolution_scale = 1;
+    g_settings.gpu_multisamples = 1;
+    g_settings.gpu_per_sample_shading = false;
+    g_settings.gpu_true_color = false;
+    g_settings.gpu_scaled_dithering = false;
+    g_settings.gpu_texture_filter = GPUTextureFilter::Nearest;
+    g_settings.gpu_disable_interlacing = false;
+    g_settings.gpu_force_ntsc_timings = false;
+    g_settings.gpu_widescreen_hack = false;
+    g_settings.gpu_pgxp_enable = false;
+    g_settings.gpu_24bit_chroma_smoothing = false;
+    g_settings.cdrom_read_speedup = false;
+    g_settings.cdrom_mute_cd_audio = false;
+    g_settings.texture_replacements.enable_vram_write_replacements = false;
+    g_settings.bios_patch_fast_boot = false;
+    g_settings.bios_patch_tty_enable = false;
+  }
+
+  if (g_settings.display_integer_scaling && g_settings.display_linear_filtering)
+  {
+    Log_WarningPrintf("Disabling linear filter due to integer upscaling.");
+    g_settings.display_linear_filtering = false;
+  }
+
   if (g_settings.gpu_pgxp_enable)
   {
     if (g_settings.gpu_renderer == GPURenderer::Software)
     {
       if (display_osd_messages)
       {
-        AddOSDMessage(TranslateStdString("OSDMessage", "PGXP is incompatible with the software renderer, disabling PGXP."), 10.0f);
+        AddOSDMessage(
+          TranslateStdString("OSDMessage", "PGXP is incompatible with the software renderer, disabling PGXP."), 10.0f);
       }
       g_settings.gpu_pgxp_enable = false;
     }
@@ -468,6 +662,35 @@ void HostInterface::FixIncompatibleSettings(bool display_osd_messages)
       g_settings.cpu_execution_mode = CPUExecutionMode::CachedInterpreter;
     }
   }
+
+#ifndef WITH_MMAP_FASTMEM
+  if (g_settings.cpu_fastmem_mode == CPUFastmemMode::MMap)
+  {
+    Log_WarningPrintf("mmap fastmem is not available on this platform, using LUT instead.");
+    g_settings.cpu_fastmem_mode = CPUFastmemMode::LUT;
+  }
+#endif
+
+  // rewinding causes issues with mmap fastmem, so just use LUT
+  if ((g_settings.rewind_enable || g_settings.IsRunaheadEnabled()) && g_settings.IsUsingFastmem() &&
+      g_settings.cpu_fastmem_mode == CPUFastmemMode::MMap)
+  {
+    Log_WarningPrintf("Disabling mmap fastmem due to rewind being enabled");
+    g_settings.cpu_fastmem_mode = CPUFastmemMode::LUT;
+  }
+
+  // code compilation is too slow with runahead, use the recompiler
+  if (g_settings.IsRunaheadEnabled() && g_settings.IsUsingCodeCache())
+  {
+    Log_WarningPrintf("Code cache/recompiler disabled due to runahead");
+    g_settings.cpu_execution_mode = CPUExecutionMode::Interpreter;
+  }
+
+  if (g_settings.IsRunaheadEnabled() && g_settings.rewind_enable)
+  {
+    Log_WarningPrintf("Rewind disabled due to runahead being enabled");
+    g_settings.rewind_enable = false;
+  }
 }
 
 void HostInterface::SaveSettings(SettingsInterface& si)
@@ -477,15 +700,26 @@ void HostInterface::SaveSettings(SettingsInterface& si)
 
 void HostInterface::CheckForSettingsChanges(const Settings& old_settings)
 {
+  if (System::IsValid() && (g_settings.gpu_renderer != old_settings.gpu_renderer ||
+                            g_settings.gpu_use_debug_device != old_settings.gpu_use_debug_device ||
+                            g_settings.gpu_threaded_presentation != old_settings.gpu_threaded_presentation))
+  {
+    AddFormattedOSDMessage(5.0f, TranslateString("OSDMessage", "Switching to %s%s GPU renderer."),
+                           Settings::GetRendererName(g_settings.gpu_renderer),
+                           g_settings.gpu_use_debug_device ? " (debug)" : "");
+    RecreateSystem();
+  }
+
   if (System::IsValid())
   {
-    if (g_settings.gpu_renderer != old_settings.gpu_renderer ||
-        g_settings.gpu_use_debug_device != old_settings.gpu_use_debug_device)
+    System::ClearMemorySaveStates();
+
+    if (g_settings.cpu_overclock_active != old_settings.cpu_overclock_active ||
+        (g_settings.cpu_overclock_active &&
+         (g_settings.cpu_overclock_numerator != old_settings.cpu_overclock_numerator ||
+          g_settings.cpu_overclock_denominator != old_settings.cpu_overclock_denominator)))
     {
-      AddFormattedOSDMessage(5.0f, "Switching to %s%s GPU renderer.",
-                             Settings::GetRendererName(g_settings.gpu_renderer),
-                             g_settings.gpu_use_debug_device ? " (debug)" : "");
-      RecreateSystem();
+      System::UpdateOverclock();
     }
 
     if (g_settings.audio_backend != old_settings.audio_backend ||
@@ -493,7 +727,7 @@ void HostInterface::CheckForSettingsChanges(const Settings& old_settings)
     {
       if (g_settings.audio_backend != old_settings.audio_backend)
       {
-        AddFormattedOSDMessage(5.0f, "Switching to %s audio backend.",
+        AddFormattedOSDMessage(5.0f, TranslateString("OSDMessage", "Switching to %s audio backend."),
                                Settings::GetAudioBackendName(g_settings.audio_backend));
       }
       DebugAssert(m_audio_stream);
@@ -505,37 +739,67 @@ void HostInterface::CheckForSettingsChanges(const Settings& old_settings)
     if (g_settings.emulation_speed != old_settings.emulation_speed)
       System::UpdateThrottlePeriod();
 
-    if (g_settings.cpu_execution_mode != old_settings.cpu_execution_mode)
+    if (g_settings.cpu_execution_mode != old_settings.cpu_execution_mode ||
+        g_settings.cpu_fastmem_mode != old_settings.cpu_fastmem_mode)
     {
-      AddFormattedOSDMessage(5.0f, "Switching to %s CPU execution mode.",
-                             Settings::GetCPUExecutionModeName(g_settings.cpu_execution_mode));
-      CPU::CodeCache::SetUseRecompiler(g_settings.cpu_execution_mode == CPUExecutionMode::Recompiler);
+      AddFormattedOSDMessage(
+        5.0f, TranslateString("OSDMessage", "Switching to %s CPU execution mode."),
+        TranslateString("CPUExecutionMode", Settings::GetCPUExecutionModeDisplayName(g_settings.cpu_execution_mode))
+          .GetCharArray());
+      CPU::CodeCache::Reinitialize();
+      CPU::ClearICache();
     }
 
     if (g_settings.cpu_execution_mode == CPUExecutionMode::Recompiler &&
         g_settings.cpu_recompiler_memory_exceptions != old_settings.cpu_recompiler_memory_exceptions)
     {
-      AddFormattedOSDMessage(5.0f, "CPU memory exceptions %s, flushing all blocks.",
-                             g_settings.cpu_recompiler_memory_exceptions ? "enabled" : "disabled");
+      AddOSDMessage(g_settings.cpu_recompiler_memory_exceptions ?
+                      TranslateStdString("OSDMessage", "CPU memory exceptions enabled, flushing all blocks.") :
+                      TranslateStdString("OSDMessage", "CPU memory exceptions disabled, flushing all blocks."),
+                    5.0f);
       CPU::CodeCache::Flush();
     }
 
-    m_audio_stream->SetOutputVolume(g_settings.audio_output_muted ? 0 : g_settings.audio_output_volume);
+    if (g_settings.cpu_execution_mode != CPUExecutionMode::Interpreter &&
+        g_settings.cpu_recompiler_icache != old_settings.cpu_recompiler_icache)
+    {
+      AddOSDMessage(g_settings.cpu_recompiler_icache ?
+                      TranslateStdString("OSDMessage", "CPU ICache enabled, flushing all blocks.") :
+                      TranslateStdString("OSDMessage", "CPU ICache disabled, flushing all blocks."),
+                    5.0f);
+      CPU::CodeCache::Flush();
+      CPU::ClearICache();
+    }
+
+    m_audio_stream->SetOutputVolume(GetAudioOutputVolume());
 
     if (g_settings.gpu_resolution_scale != old_settings.gpu_resolution_scale ||
+        g_settings.gpu_multisamples != old_settings.gpu_multisamples ||
+        g_settings.gpu_per_sample_shading != old_settings.gpu_per_sample_shading ||
+        g_settings.gpu_use_thread != old_settings.gpu_use_thread ||
         g_settings.gpu_fifo_size != old_settings.gpu_fifo_size ||
         g_settings.gpu_max_run_ahead != old_settings.gpu_max_run_ahead ||
         g_settings.gpu_true_color != old_settings.gpu_true_color ||
         g_settings.gpu_scaled_dithering != old_settings.gpu_scaled_dithering ||
-        g_settings.gpu_texture_filtering != old_settings.gpu_texture_filtering ||
+        g_settings.gpu_texture_filter != old_settings.gpu_texture_filter ||
         g_settings.gpu_disable_interlacing != old_settings.gpu_disable_interlacing ||
         g_settings.gpu_force_ntsc_timings != old_settings.gpu_force_ntsc_timings ||
+        g_settings.gpu_24bit_chroma_smoothing != old_settings.gpu_24bit_chroma_smoothing ||
+        g_settings.gpu_downsample_mode != old_settings.gpu_downsample_mode ||
         g_settings.display_crop_mode != old_settings.display_crop_mode ||
         g_settings.display_aspect_ratio != old_settings.display_aspect_ratio ||
         g_settings.gpu_pgxp_enable != old_settings.gpu_pgxp_enable ||
+        g_settings.gpu_pgxp_depth_buffer != old_settings.gpu_pgxp_depth_buffer ||
         g_settings.display_active_start_offset != old_settings.display_active_start_offset ||
-        g_settings.display_active_end_offset != old_settings.display_active_end_offset)
+        g_settings.display_active_end_offset != old_settings.display_active_end_offset ||
+        g_settings.display_line_start_offset != old_settings.display_line_start_offset ||
+        g_settings.display_line_end_offset != old_settings.display_line_end_offset ||
+        g_settings.rewind_enable != old_settings.rewind_enable ||
+        g_settings.runahead_frames != old_settings.runahead_frames)
     {
+      if (g_settings.IsUsingCodeCache())
+        CPU::CodeCache::Reinitialize();
+
       g_gpu->UpdateSettings();
     }
 
@@ -544,10 +808,15 @@ void HostInterface::CheckForSettingsChanges(const Settings& old_settings)
     {
       if (g_settings.IsUsingCodeCache())
       {
-        AddFormattedOSDMessage(5.0f, "PGXP %s, recompiling all blocks.",
-                               g_settings.gpu_pgxp_enable ? "enabled" : "disabled");
+        AddOSDMessage(g_settings.gpu_pgxp_enable ?
+                        TranslateStdString("OSDMessage", "PGXP enabled, recompiling all blocks.") :
+                        TranslateStdString("OSDMessage", "PGXP disabled, recompiling all blocks."),
+                      5.0f);
         CPU::CodeCache::Flush();
       }
+
+      if (old_settings.gpu_pgxp_enable)
+        PGXP::Shutdown();
 
       if (g_settings.gpu_pgxp_enable)
         PGXP::Initialize();
@@ -562,6 +831,21 @@ void HostInterface::CheckForSettingsChanges(const Settings& old_settings)
          System::HasMediaPlaylist()))
     {
       System::UpdateMemoryCards();
+    }
+
+    if (g_settings.rewind_enable != old_settings.rewind_enable ||
+        g_settings.rewind_save_frequency != old_settings.rewind_save_frequency ||
+        g_settings.rewind_save_slots != old_settings.rewind_save_slots ||
+        g_settings.runahead_frames != old_settings.runahead_frames)
+    {
+      System::UpdateMemorySaveStateSettings();
+    }
+
+    if (g_settings.texture_replacements.enable_vram_write_replacements !=
+          old_settings.texture_replacements.enable_vram_write_replacements ||
+        g_settings.texture_replacements.preload_textures != old_settings.texture_replacements.preload_textures)
+    {
+      g_texture_replacements.Reload();
     }
 
     g_dma.SetMaxSliceTicks(g_settings.dma_max_slice_ticks);
@@ -618,7 +902,7 @@ std::string HostInterface::GetUserDirectoryRelativePath(const char* format, ...)
   }
   else
   {
-    return StringUtil::StdStringFromFormat("%s%c%s", m_user_directory.c_str(), FS_OSPATH_SEPERATOR_CHARACTER,
+    return StringUtil::StdStringFromFormat("%s" FS_OSPATH_SEPARATOR_STR "%s", m_user_directory.c_str(),
                                            formatted_path.c_str());
   }
 }
@@ -636,7 +920,7 @@ std::string HostInterface::GetProgramDirectoryRelativePath(const char* format, .
   }
   else
   {
-    return StringUtil::StdStringFromFormat("%s%c%s", m_program_directory.c_str(), FS_OSPATH_SEPERATOR_CHARACTER,
+    return StringUtil::StdStringFromFormat("%s" FS_OSPATH_SEPARATOR_STR "%s", m_program_directory.c_str(),
                                            formatted_path.c_str());
   }
 }
@@ -652,12 +936,12 @@ TinyString HostInterface::GetTimestampStringForFileName()
 
 std::string HostInterface::GetSharedMemoryCardPath(u32 slot) const
 {
-  return GetUserDirectoryRelativePath("memcards/shared_card_%d.mcd", slot + 1);
+  return GetUserDirectoryRelativePath("memcards" FS_OSPATH_SEPARATOR_STR "shared_card_%u.mcd", slot + 1);
 }
 
 std::string HostInterface::GetGameMemoryCardPath(const char* game_code, u32 slot) const
 {
-  return GetUserDirectoryRelativePath("memcards/%s_%d.mcd", game_code, slot + 1);
+  return GetUserDirectoryRelativePath("memcards" FS_OSPATH_SEPARATOR_STR "%s_%u.mcd", game_code, slot + 1);
 }
 
 bool HostInterface::GetBoolSettingValue(const char* section, const char* key, bool default_value /*= false*/)
@@ -700,6 +984,43 @@ std::string HostInterface::TranslateStdString(const char* context, const char* s
   return str;
 }
 
+bool HostInterface::GetMainDisplayRefreshRate(float* refresh_rate)
+{
+#ifdef _WIN32
+  static HMODULE dwm_module = nullptr;
+  static HRESULT(STDAPICALLTYPE * get_timing_info)(HWND hwnd, DWM_TIMING_INFO * pTimingInfo) = nullptr;
+  static bool load_tried = false;
+  if (!load_tried)
+  {
+    load_tried = true;
+    dwm_module = LoadLibrary("dwmapi.dll");
+    if (dwm_module)
+    {
+      std::atexit([]() {
+        FreeLibrary(dwm_module);
+        dwm_module = nullptr;
+      });
+      get_timing_info =
+        reinterpret_cast<decltype(get_timing_info)>(GetProcAddress(dwm_module, "DwmGetCompositionTimingInfo"));
+    }
+  }
+
+  DWM_TIMING_INFO ti = {};
+  ti.cbSize = sizeof(ti);
+  HRESULT hr = get_timing_info(nullptr, &ti);
+  if (SUCCEEDED(hr))
+  {
+    if (ti.rateRefresh.uiNumerator == 0 || ti.rateRefresh.uiDenominator == 0)
+      return false;
+
+    *refresh_rate = static_cast<float>(ti.rateRefresh.uiNumerator) / static_cast<float>(ti.rateRefresh.uiDenominator);
+    return true;
+  }
+#endif
+
+  return false;
+}
+
 void HostInterface::ToggleSoftwareRendering()
 {
   if (System::IsShutdown() || g_settings.gpu_renderer == GPURenderer::Software)
@@ -707,7 +1028,8 @@ void HostInterface::ToggleSoftwareRendering()
 
   const GPURenderer new_renderer = g_gpu->IsHardwareRenderer() ? GPURenderer::Software : g_settings.gpu_renderer;
 
-  AddFormattedOSDMessage(5.0f, "Switching to %s renderer...", Settings::GetRendererDisplayName(new_renderer));
+  AddFormattedOSDMessage(5.0f, TranslateString("OSDMessage", "Switching to %s renderer..."),
+                         Settings::GetRendererDisplayName(new_renderer));
   System::RecreateGPU(new_renderer);
 }
 
@@ -725,6 +1047,7 @@ void HostInterface::ModifyResolutionScale(s32 increment)
     g_gpu->RestoreGraphicsAPIState();
     g_gpu->UpdateSettings();
     g_gpu->ResetGraphicsAPIState();
+    System::ClearMemorySaveStates();
   }
 }
 
@@ -732,19 +1055,27 @@ void HostInterface::UpdateSoftwareCursor()
 {
   if (System::IsShutdown())
   {
+    SetMouseMode(false, false);
     m_display->ClearSoftwareCursor();
     return;
   }
 
   const Common::RGBA8Image* image = nullptr;
   float image_scale = 1.0f;
+  bool relative_mode = false;
+  bool hide_cursor = false;
 
   for (u32 i = 0; i < NUM_CONTROLLER_AND_CARD_PORTS; i++)
   {
     Controller* controller = System::GetController(i);
-    if (controller && controller->GetSoftwareCursor(&image, &image_scale))
+    if (controller && controller->GetSoftwareCursor(&image, &image_scale, &relative_mode))
+    {
+      hide_cursor = true;
       break;
+    }
   }
+
+  SetMouseMode(relative_mode, hide_cursor);
 
   if (image && image->IsValid())
   {
@@ -781,6 +1112,8 @@ void HostInterface::RecreateSystem()
 
   System::ResetPerformanceCounters();
 }
+
+void HostInterface::SetMouseMode(bool relative, bool hide_cursor) {}
 
 void HostInterface::DisplayLoadingScreen(const char* message, int progress_min /*= -1*/, int progress_max /*= -1*/,
                                          int progress_value /*= -1*/)

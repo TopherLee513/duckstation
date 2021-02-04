@@ -14,8 +14,14 @@ class HostInterface;
 class Controller
 {
 public:
+  enum class AxisType : u8
+  {
+    Full,
+    Half
+  };
+
   using ButtonList = std::vector<std::pair<std::string, s32>>;
-  using AxisList = std::vector<std::pair<std::string, s32>>;
+  using AxisList = std::vector<std::tuple<std::string, s32, AxisType>>;
   using SettingList = std::vector<SettingInfo>;
 
   Controller();
@@ -31,7 +37,7 @@ public:
   virtual std::optional<s32> GetButtonCodeByName(std::string_view button_name) const;
 
   virtual void Reset();
-  virtual bool DoState(StateWrapper& sw);
+  virtual bool DoState(StateWrapper& sw, bool apply_input_state);
 
   // Resets all state for the transferring to/from the device.
   virtual void ResetTransferState();
@@ -45,6 +51,12 @@ public:
   /// Changes the specified button state.
   virtual void SetButtonState(s32 button_code, bool pressed);
 
+  /// Returns a bitmask of the current button states, 1 = on.
+  virtual u32 GetButtonStateBits() const;
+
+  /// Returns analog input bytes packed as a u32. Values are specific to controller type.
+  virtual std::optional<u32> GetAnalogInputBytes() const;
+
   /// Returns the number of vibration motors.
   virtual u32 GetVibrationMotorCount() const;
 
@@ -55,7 +67,7 @@ public:
   virtual void LoadSettings(const char* section);
 
   /// Returns the software cursor to use for this controller, if any.
-  virtual bool GetSoftwareCursor(const Common::RGBA8Image** image, float* image_scale);
+  virtual bool GetSoftwareCursor(const Common::RGBA8Image** image, float* image_scale, bool* relative_mode);
 
   /// Creates a new controller of the specified type.
   static std::unique_ptr<Controller> Create(ControllerType type, u32 index);

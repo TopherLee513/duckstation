@@ -158,16 +158,17 @@ void XInputControllerInterface::CheckForStateChanges(u32 index, const XINPUT_STA
 
 void XInputControllerInterface::ClearBindings()
 {
-  for (auto& it : m_controllers)
+  for (ControllerData& cd : m_controllers)
   {
-    for (AxisCallback& ac : it.axis_mapping)
-      ac = {};
-    for (ButtonCallback& bc : it.button_mapping)
-      bc = {};
+    cd.axis_mapping.fill({});
+    cd.button_mapping.fill({});
+    cd.axis_button_mapping.fill({});
+    cd.button_axis_mapping.fill({});
   }
 }
 
-bool XInputControllerInterface::BindControllerAxis(int controller_index, int axis_number, AxisCallback callback)
+bool XInputControllerInterface::BindControllerAxis(int controller_index, int axis_number, AxisSide axis_side,
+                                                   AxisCallback callback)
 {
   if (static_cast<u32>(controller_index) >= m_controllers.size() || !m_controllers[controller_index].connected)
     return false;
@@ -175,7 +176,7 @@ bool XInputControllerInterface::BindControllerAxis(int controller_index, int axi
   if (axis_number < 0 || axis_number >= NUM_AXISES)
     return false;
 
-  m_controllers[controller_index].axis_mapping[axis_number] = std::move(callback);
+  m_controllers[controller_index].axis_mapping[axis_number][axis_side] = std::move(callback);
   return true;
 }
 
@@ -204,6 +205,26 @@ bool XInputControllerInterface::BindControllerAxisToButton(int controller_index,
   return true;
 }
 
+bool XInputControllerInterface::BindControllerHatToButton(int controller_index, int hat_number,
+                                                          std::string_view hat_position, ButtonCallback callback)
+{
+  // Hats don't exist in XInput
+  return false;
+}
+
+bool XInputControllerInterface::BindControllerButtonToAxis(int controller_index, int button_number,
+                                                           AxisCallback callback)
+{
+  if (static_cast<u32>(controller_index) >= m_controllers.size() || !m_controllers[controller_index].connected)
+    return false;
+
+  if (button_number < 0 || button_number >= MAX_NUM_BUTTONS)
+    return false;
+
+  m_controllers[controller_index].button_axis_mapping[button_number] = std::move(callback);
+  return true;
+}
+
 bool XInputControllerInterface::HandleAxisEvent(u32 index, Axis axis, s32 value)
 {
   const float f_value = static_cast<float>(value) / (value < 0 ? 32768.0f : 32767.0f);
@@ -213,11 +234,18 @@ bool XInputControllerInterface::HandleAxisEvent(u32 index, Axis axis, s32 value)
   if (DoEventHook(Hook::Type::Axis, index, static_cast<u32>(axis), f_value))
     return true;
 
-  const AxisCallback& cb = m_controllers[index].axis_mapping[static_cast<u32>(axis)];
+  const AxisCallback& cb = m_controllers[index].axis_mapping[static_cast<u32>(axis)][AxisSide::Full];
   if (cb)
   {
-    // Apply axis scaling only when controller axis is mapped to an axis
-    cb(std::clamp(m_controllers[index].axis_scale * f_value, -1.0f, 1.0f));
+    // Extend triggers from a 0 - 1 range to a -1 - 1 range for consistency with other inputs
+    if (axis == Axis::LeftTrigger || axis == Axis::RightTrigger)
+    {
+      cb((f_value * 2.0f) - 1.0f);
+    }
+    else
+    {
+      cb(f_value);
+    }
     return true;
   }
 
@@ -255,10 +283,17 @@ bool XInputControllerInterface::HandleButtonEvent(u32 index, u32 button, bool pr
     return true;
 
   const ButtonCallback& cb = m_controllers[index].button_mapping[button];
-  if (!cb)
-    return false;
+  if (cb)
+  {
+    cb(pressed);
+    return true;
+  }
 
-  cb(pressed);
+  const AxisCallback& axis_cb = m_controllers[index].button_axis_mapping[button];
+  if (axis_cb)
+  {
+    axis_cb(pressed ? 1.0f : -1.0f);
+  }
   return true;
 }
 
@@ -275,25 +310,10 @@ void XInputControllerInterface::SetControllerRumbleStrength(int controller_index
 {
   DebugAssert(static_cast<u32>(controller_index) < XUSER_MAX_COUNT);
 
-  // we'll update before this duration is elapsed
-  static constexpr float MIN_STRENGTH = 0.01f;
-  static constexpr u32 DURATION = 100000;
-
   XINPUT_VIBRATION vib;
-  vib.wLeftMotorSpeed = (strengths[0] >= MIN_STRENGTH) ? static_cast<u16>(strengths[0] * 65535.0f) : 0;
-  vib.wRightMotorSpeed = (strengths[1] >= MIN_STRENGTH) ? static_cast<u16>(strengths[1] * 65535.0f) : 0;
+  vib.wLeftMotorSpeed = static_cast<u16>(strengths[0] * 65535.0f);
+  vib.wRightMotorSpeed = static_cast<u16>(strengths[1] * 65535.0f);
   m_xinput_set_state(static_cast<u32>(controller_index), &vib);
-}
-
-bool XInputControllerInterface::SetControllerAxisScale(int controller_index, float scale /* = 1.00f */)
-{
-  if (static_cast<u32>(controller_index) >= XUSER_MAX_COUNT || !m_controllers[controller_index].connected)
-    return false;
-
-  m_controllers[static_cast<u32>(controller_index)].axis_scale = std::clamp(std::abs(scale), 0.01f, 1.50f);
-  Log_InfoPrintf("Controller %d axis scale set to %f", controller_index,
-                 m_controllers[static_cast<u32>(controller_index)].axis_scale);
-  return true;
 }
 
 bool XInputControllerInterface::SetControllerDeadzone(int controller_index, float size /* = 0.25f */)

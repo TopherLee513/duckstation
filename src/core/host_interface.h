@@ -22,6 +22,10 @@ class GameList;
 
 struct SystemBootParameters;
 
+namespace BIOS {
+struct ImageInfo;
+}
+
 class HostInterface
 {
 public:
@@ -49,7 +53,7 @@ public:
 
   virtual bool BootSystem(const SystemBootParameters& parameters);
   virtual void PowerOffSystem();
-
+  virtual void PauseSystem(bool paused);
   virtual void ResetSystem();
   virtual void DestroySystem();
 
@@ -58,10 +62,12 @@ public:
 
   virtual void ReportError(const char* message);
   virtual void ReportMessage(const char* message);
+  virtual void ReportDebuggerMessage(const char* message);
   virtual bool ConfirmMessage(const char* message);
 
   void ReportFormattedError(const char* format, ...);
   void ReportFormattedMessage(const char* format, ...);
+  void ReportFormattedDebuggerMessage(const char* format, ...);
   bool ConfirmFormattedMessage(const char* format, ...);
 
   /// Adds OSD messages, duration is in seconds.
@@ -113,8 +119,29 @@ public:
   virtual TinyString TranslateString(const char* context, const char* str) const;
   virtual std::string TranslateStdString(const char* context, const char* str) const;
 
+  /// Returns the refresh rate for the "main" display. Use when it's not possible to query the graphics API for the
+  /// refresh rate of the monitor the window is running in.
+  virtual bool GetMainDisplayRefreshRate(float* refresh_rate);
+
+  /// Returns the path to the directory to search for BIOS images.
+  virtual std::string GetBIOSDirectory();
+
   /// Loads the BIOS image for the specified region.
   std::optional<std::vector<u8>> GetBIOSImage(ConsoleRegion region);
+
+  /// Searches for a BIOS image for the specified region in the specified directory. If no match is found, the first
+  /// BIOS image within 512KB and 4MB will be used.
+  std::optional<std::vector<u8>> FindBIOSImageInDirectory(ConsoleRegion region, const char* directory);
+
+  /// Returns a list of filenames and descriptions for BIOS images in a directory.
+  std::vector<std::pair<std::string, const BIOS::ImageInfo*>> FindBIOSImagesInDirectory(const char* directory);
+
+  /// Returns true if any BIOS images are found in the configured BIOS directory.
+  bool HasAnyBIOSImages();
+
+  /// Opens a file in the DuckStation "package".
+  /// This is the APK for Android builds, or the program directory for standalone builds.
+  virtual std::unique_ptr<ByteStream> OpenPackageFile(const char* path, u32 flags) = 0;
 
   virtual void OnRunningGameChanged();
   virtual void OnSystemPerformanceCountersUpdated();
@@ -123,14 +150,19 @@ protected:
   virtual bool AcquireHostDisplay() = 0;
   virtual void ReleaseHostDisplay() = 0;
   virtual std::unique_ptr<AudioStream> CreateAudioStream(AudioBackend backend) = 0;
+  virtual s32 GetAudioOutputVolume() const;
 
   virtual void OnSystemCreated();
+  virtual void OnSystemPaused(bool paused);
   virtual void OnSystemDestroyed();
   virtual void OnSystemStateSaved(bool global, s32 slot);
   virtual void OnControllerTypeChanged(u32 slot);
 
   /// Restores all settings to defaults.
   virtual void SetDefaultSettings(SettingsInterface& si);
+
+  /// Performs the initial load of settings. Should call CheckSettings() and LoadSettings(SettingsInterface&).
+  virtual void LoadSettings() = 0;
 
   /// Loads settings to m_settings and any frontend-specific parameters.
   virtual void LoadSettings(SettingsInterface& si);
@@ -146,6 +178,9 @@ protected:
 
   /// Switches the GPU renderer by saving state, recreating the display window, and restoring state (if needed).
   virtual void RecreateSystem();
+
+  /// Enables "relative" mouse mode, locking the cursor position and returning relative coordinates.
+  virtual void SetMouseMode(bool relative, bool hide_cursor);
 
   /// Sets the user directory to the program directory, i.e. "portable mode".
   void SetUserDirectoryToProgramDirectory();

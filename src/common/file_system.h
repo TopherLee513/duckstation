@@ -10,9 +10,11 @@
 class ByteStream;
 
 #ifdef WIN32
-#define FS_OSPATH_SEPERATOR_CHARACTER '\\'
+#define FS_OSPATH_SEPARATOR_CHARACTER '\\'
+#define FS_OSPATH_SEPARATOR_STR "\\"
 #else
-#define FS_OSPATH_SEPERATOR_CHARACTER '/'
+#define FS_OSPATH_SEPARATOR_CHARACTER '/'
+#define FS_OSPATH_SEPARATOR_STR "/"
 #endif
 
 enum FILESYSTEM_FILE_ATTRIBUTES
@@ -146,6 +148,15 @@ std::string ReplaceExtension(std::string_view path, std::string_view new_extensi
 /// Returns the directory component of a filename.
 std::string GetPathDirectory(const char* path);
 
+/// Returns the filename component of a filename.
+std::string_view GetFileNameFromPath(const char* path);
+
+/// Returns the file title (less the extension and path) from a filename.
+std::string_view GetFileTitleFromPath(const char* path);
+
+/// Returns a list of "root directories" (i.e. root/home directories on Linux, drive letters on Windows).
+std::vector<std::string> GetRootDirectoryList();
+
 // search for files
 bool FindFiles(const char* Path, const char* Pattern, u32 Flags, FindResultsArray* pResults);
 
@@ -172,6 +183,12 @@ std::optional<std::vector<u8>> ReadBinaryFile(const char* filename);
 std::optional<std::string> ReadFileToString(const char* filename);
 bool WriteBinaryFile(const char* filename, const void* data, size_t data_length);
 bool WriteFileToString(const char* filename, const std::string_view& sv);
+
+std::string ReadStreamToString(ByteStream* stream, bool seek_to_start = true);
+bool WriteStreamToString(const std::string_view& sv, ByteStream* stream);
+
+std::vector<u8> ReadBinaryStream(ByteStream* stream, bool seek_to_start = true);
+bool WriteBinaryToSTream(ByteStream* stream, const void* data, size_t data_length);
 
 // creates a directory in the local filesystem
 // if the directory already exists, the return value will be true.
